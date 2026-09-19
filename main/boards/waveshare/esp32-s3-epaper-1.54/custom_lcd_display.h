@@ -39,8 +39,17 @@ public:
     void EPD_Init_Partial();
     void EPD_DisplayPart();
     void EPD_DrawColorPixel(uint16_t x, uint16_t y,uint8_t color);
-    
+         
+		 /* Pixel art face */
+    void DrawFace(int face_type);
+    virtual void SetEmotion(const char* emotion) override;
+    virtual void SetStatus(const char* status) override;
+	virtual void SetupUI() override;
+	virtual void SetChatMessage(const char* role, const char* content) override;
+	virtual void SetTheme(Theme* theme) override;
+	
 private:
+    int current_face_ = -1;
     const custom_lcd_spi_t lcd_spi_data;
     const int Width;
     const int Height;

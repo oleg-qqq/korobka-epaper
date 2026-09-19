@@ -8,6 +8,8 @@
 #include "config.h"
 #include "esp_lvgl_port.h"
 #include "settings.h"
+#include "pixel_face.h"
+#include "display/display.h"
 
 #define TAG "CustomLcdDisplay"
 
@@ -400,4 +402,71 @@ void CustomLcdDisplay::EPD_DrawColorPixel(uint16_t x, uint16_t y, uint8_t color)
     } else {
         buffer[index] &= ~(0x01 << bit);
     }
+}
+
+/* ==================== Pixel art face ==================== */
+
+void CustomLcdDisplay::DrawFace(int face_type) {
+    if (face_type < 0 || face_type >= FACE_COUNT) {
+        return;
+    }
+	
+    if (face_type == current_face_) {
+        return;  // уже нарисовано, не трогаем экран
+    }
+    current_face_ = face_type;
+	
+    const int cell = Width / FACE_GRID;   // размер одного "пикселя" лица
+    const int offset = (Width - cell * FACE_GRID) / 2;
+
+    EPD_Clear();
+
+    for (int row = 0; row < FACE_GRID; row++) {
+        const char* line = kFaces[face_type][row];
+        for (int col = 0; col < FACE_GRID; col++) {
+            if (line[col] != '#') {
+                continue;
+            }
+            for (int dy = 0; dy < cell; dy++) {
+                for (int dx = 0; dx < cell; dx++) {
+                    EPD_DrawColorPixel(offset + col * cell + dx,
+                                       offset + row * cell + dy,
+                                       DRIVER_COLOR_BLACK);
+                }
+            }
+        }
+    }
+
+    EPD_DisplayPart();
+}
+
+void CustomLcdDisplay::SetEmotion(const char* emotion) {
+    ESP_LOGI(TAG, "SetEmotion: %s", emotion);
+
+    if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "laughing") == 0 ||
+        strcmp(emotion, "funny") == 0 || strcmp(emotion, "loving") == 0) {
+        DrawFace(FACE_HAPPY);
+    } else if (strcmp(emotion, "thinking") == 0) {
+        DrawFace(FACE_THINKING);
+    } else {
+        DrawFace(FACE_IDLE);
+    }
+}
+
+void CustomLcdDisplay::SetStatus(const char* status) {
+    ESP_LOGI(TAG, "SetStatus: %s", status);
+    DrawFace(FACE_LISTENING);
+}
+void CustomLcdDisplay::SetupUI() {
+    ESP_LOGI(TAG, "Custom SetupUI: skipping default widgets");
+    Display::SetupUI();   // только помечаем, что UI готов
+    DrawFace(FACE_IDLE);  // сразу рисуем лицо
+}
+void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
+    ESP_LOGI(TAG, "ChatMessage [%s]: %s", role, content);
+    // ничего не рисуем, лицо остаётся
+}
+void CustomLcdDisplay::SetTheme(Theme* theme) {
+    ESP_LOGI(TAG, "SetTheme: skipped (custom face UI)");
+    // не применяем тему, виджетов нет
 }
