@@ -32,6 +32,9 @@ class CustomBoard : public WifiBoard {
     adc_oneshot_unit_handle_t adc1_handle;
     adc_cali_handle_t         cali_handle;
     esp_timer_handle_t timer_handle_ = nullptr;
+	esp_timer_handle_t alarm_handle_ = nullptr;
+	int alarm_count_ = 0;
+    int saved_volume_ = 0;
     int64_t timer_end_us_ = 0;
     int64_t stopwatch_start_us_ = 0;
     bool stopwatch_running_ = false;
@@ -212,16 +215,45 @@ class CustomBoard : public WifiBoard {
         } while (!gpio_get_level(VBAT_PWR_GPIO));
     }
 	
-	    void EnsureTimer() {
+	       void EnsureTimer() {
         if (timer_handle_) return;
         esp_timer_create_args_t args = {};
-        args.callback = [](void *) {
-            Application::GetInstance().Schedule([]() {
-                Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
-            });
+        args.callback = [](void *arg) {
+            auto *self = static_cast<CustomBoard *>(arg);
+            Application::GetInstance().Schedule([self]() { self->StartAlarm(); });
         };
+        args.arg = this;
         args.name = "user_timer";
         esp_timer_create(&args, &timer_handle_);
+    }
+
+    void StartAlarm() {
+        if (!alarm_handle_) {
+            esp_timer_create_args_t args = {};
+            args.callback = [](void *arg) {
+                auto *self = static_cast<CustomBoard *>(arg);
+                Application::GetInstance().Schedule([self]() { self->AlarmTick(); });
+            };
+            args.arg = this;
+            args.name = "alarm_repeat";
+            esp_timer_create(&args, &alarm_handle_);
+        }
+        esp_timer_stop(alarm_handle_);
+        alarm_count_ = 0;
+        auto codec = GetAudioCodec();
+        saved_volume_ = codec->output_volume();
+        codec->SetOutputVolume(100);
+        esp_timer_start_periodic(alarm_handle_, 1000000);
+    }
+
+    void AlarmTick() {
+        if (alarm_count_ >= 5) {
+            esp_timer_stop(alarm_handle_);
+            GetAudioCodec()->SetOutputVolume(saved_volume_);
+            return;
+        }
+        Application::GetInstance().PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+        alarm_count_++;
     }
 
     uint16_t BatterygetVoltage(void) {
