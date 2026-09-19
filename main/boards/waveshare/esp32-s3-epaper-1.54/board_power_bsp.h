@@ -18,6 +18,8 @@ public:
     void PowerAudioOff();
     void VbatPowerOn();
     void VbatPowerOff();
+	void LedOn();
+    void LedOff();
 };
 
 #endif

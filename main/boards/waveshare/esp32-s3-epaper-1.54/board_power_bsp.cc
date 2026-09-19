@@ -28,7 +28,15 @@ BoardPowerBsp::BoardPowerBsp(int epdPowerPin, int audioPowerPin, int vbatPowerPi
     gpio_conf.pull_down_en  = GPIO_PULLDOWN_DISABLE;
     gpio_conf.pull_up_en    = GPIO_PULLUP_ENABLE;
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
-    xTaskCreatePinnedToCore(PowerLedTask, "PowerLedTask", 3 * 1024, NULL, 2, NULL, 0);
+    //xTaskCreatePinnedToCore(PowerLedTask, "PowerLedTask", 3 * 1024, NULL, 2, NULL, 0);
+	gpio_config_t led_conf = {};
+    led_conf.intr_type     = GPIO_INTR_DISABLE;
+    led_conf.mode          = GPIO_MODE_OUTPUT;
+    led_conf.pin_bit_mask  = (0x1ULL << GPIO_NUM_3);
+    led_conf.pull_down_en  = GPIO_PULLDOWN_DISABLE;
+    led_conf.pull_up_en    = GPIO_PULLUP_ENABLE;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&led_conf));
+    gpio_set_level(GPIO_NUM_3, 1);  // выключен по умолчанию
 }
 
 BoardPowerBsp::~BoardPowerBsp() {
@@ -56,4 +64,11 @@ void BoardPowerBsp::VbatPowerOn() {
 
 void BoardPowerBsp::VbatPowerOff() {
     gpio_set_level((gpio_num_t) vbatPowerPin_, 0);
+}
+void BoardPowerBsp::LedOn() {
+    gpio_set_level(GPIO_NUM_3, 0);
+}
+
+void BoardPowerBsp::LedOff() {
+    gpio_set_level(GPIO_NUM_3, 1);
 }

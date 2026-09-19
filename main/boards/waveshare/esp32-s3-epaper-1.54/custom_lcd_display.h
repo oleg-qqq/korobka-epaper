@@ -30,12 +30,12 @@ public:
                   bool mirror_x, bool mirror_y, bool swap_xy,custom_lcd_spi_t _lcd_spi_data);
     ~CustomLcdDisplay();
 
-    void EPD_Init();    /* 墨水屏初始化 */
-    void EPD_Clear();   /* 清空屏幕 */
-    void EPD_Display(); /* 刷buffer到墨水屏 */
-    
-    /*快速刷新*/
-    void EPD_DisplayPartBaseImage();
+    void EPD_Init();    /* e-paper init */
+	void EPD_Clear();   /* clear screen */
+	void EPD_Display(); /* flush buffer to e-paper */
+
+	/* fast refresh */
+	void EPD_DisplayPartBaseImage();
     void EPD_Init_Partial();
     void EPD_DisplayPart();
     void EPD_DrawColorPixel(uint16_t x, uint16_t y,uint8_t color);

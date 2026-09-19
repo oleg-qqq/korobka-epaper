@@ -37,7 +37,8 @@ class CustomBoard : public WifiBoard {
         i2c_bus_cfg.trans_queue_depth = 0;
         i2c_bus_cfg.flags.enable_internal_pullup = 1;
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
-    }
+		
+	}
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
@@ -52,7 +53,7 @@ class CustomBoard : public WifiBoard {
 
         pwr_button_.OnLongPress([this]() {
             display_->DrawFace(FACE_DEAD);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(2000));
             power_->PowerAudioOff();
             power_->PowerEpdOff();
             power_->VbatPowerOff();
@@ -61,10 +62,23 @@ class CustomBoard : public WifiBoard {
 
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
-        mcp_server.AddTool("self.disp.network", "重新配网", PropertyList(), [this](const PropertyList &) -> ReturnValue {
+        mcp_server.AddTool("self.disp.network", "Reconfigure WiFi connection", PropertyList(), [this](const PropertyList &) -> ReturnValue {
             EnterWifiConfigMode();
             return true;
         });
+
+        mcp_server.AddTool("self.sensor.get_room_climate",
+            "Get current room temperature in Celsius and humidity in percent from the built-in sensor",
+            PropertyList(), [this](const PropertyList &) -> ReturnValue {
+                float t = 0, h = 0;
+                if (!ReadSHTC3(t, h)) {
+                    return std::string("{\"success\":false}");
+                }
+                char buf[96];
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"temperature\":%.1f,\"humidity\":%.1f}", t, h);
+                return std::string(buf);
+            });
     }
 
     void InitializeLcdDisplay() {
@@ -143,6 +157,61 @@ class CustomBoard : public WifiBoard {
         return (uint8_t)percent;
     }
 
+    bool ReadSHTC3(float &temperature, float &humidity) {
+        static i2c_master_dev_handle_t shtc3_dev = nullptr;
+
+        if (shtc3_dev == nullptr) {
+            i2c_device_config_t dev_cfg = {};
+            dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+            dev_cfg.device_address  = 0x70;
+            dev_cfg.scl_speed_hz    = 100000;
+            if (i2c_master_bus_add_device(i2c_bus_, &dev_cfg, &shtc3_dev) != ESP_OK) {
+                ESP_LOGE(TAG, "SHTC3: failed to add device");
+                return false;
+            }
+        }
+
+        // Wakeup
+        uint8_t wakeup[2] = {0x35, 0x17};
+        i2c_master_transmit(shtc3_dev, wakeup, 2, 100);
+        vTaskDelay(pdMS_TO_TICKS(2));
+
+        // Measure T first, normal mode, clock stretching disabled
+        uint8_t cmd[2] = {0x78, 0x66};
+        if (i2c_master_transmit(shtc3_dev, cmd, 2, 100) != ESP_OK) {
+            ESP_LOGE(TAG, "SHTC3: measure cmd failed");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+                uint8_t data[6] = {0};
+        esp_err_t rerr = ESP_FAIL;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            rerr = i2c_master_receive(shtc3_dev, data, 6, 100);
+            if (rerr == ESP_OK) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (rerr != ESP_OK) {
+            ESP_LOGE(TAG, "SHTC3: read failed");
+            return false;
+        }
+
+        // Sleep
+        uint8_t sleep_cmd[2] = {0xB0, 0x98};
+        i2c_master_transmit(shtc3_dev, sleep_cmd, 2, 100);
+
+        uint16_t raw_t = (data[0] << 8) | data[1];
+        uint16_t raw_h = (data[3] << 8) | data[4];
+
+        temperature = -45.0f + 175.0f * (float)raw_t / 65535.0f - 4.7f;
+        humidity    = 100.0f * (float)raw_h / 65535.0f + 3.0f;
+
+        ESP_LOGI(TAG, "SHTC3: %.1f C, %.1f %%", temperature, humidity);
+        return true;
+    }
+	
   public:
     CustomBoard() : boot_button_(BOOT_BUTTON_GPIO), pwr_button_(VBAT_PWR_GPIO) {
         Power_Init();
