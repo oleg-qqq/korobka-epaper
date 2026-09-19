@@ -12,6 +12,7 @@
 #include "custom_lcd_display.h"
 #include "lvgl.h"
 #include "mcp_server.h"
+#include "pixel_face.h"
 
 #define TAG "waveshare_epaper_1_54"
 
@@ -50,7 +51,7 @@ class CustomBoard : public WifiBoard {
         });
 
         pwr_button_.OnLongPress([this]() {
-            GetDisplay()->SetChatMessage("system", "OFF");
+            display_->DrawFace(FACE_DEAD);
             vTaskDelay(pdMS_TO_TICKS(1000));
             power_->PowerAudioOff();
             power_->PowerEpdOff();
