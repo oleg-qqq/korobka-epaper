@@ -13,6 +13,12 @@
 #include "lvgl.h"
 #include "mcp_server.h"
 #include "pixel_face.h"
+#include <esp_timer.h>
+#include "application.h"
+#include "mcp_server.h"
+#include <esp_random.h>
+#include <string>
+#include "assets/lang_config.h"
 
 #define TAG "waveshare_epaper_1_54"
 
@@ -25,7 +31,12 @@ class CustomBoard : public WifiBoard {
     BoardPowerBsp            *power_;
     adc_oneshot_unit_handle_t adc1_handle;
     adc_cali_handle_t         cali_handle;
+    esp_timer_handle_t timer_handle_ = nullptr;
+    int64_t timer_end_us_ = 0;
+    int64_t stopwatch_start_us_ = 0;
+    bool stopwatch_running_ = false;
 
+	
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {};
         i2c_bus_cfg.i2c_port          = (i2c_port_t) 0;
@@ -60,13 +71,28 @@ class CustomBoard : public WifiBoard {
         });
     }
 
-    void InitializeTools() {
+        void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
+
+
         mcp_server.AddTool("self.disp.network", "Reconfigure WiFi connection", PropertyList(), [this](const PropertyList &) -> ReturnValue {
             EnterWifiConfigMode();
             return true;
         });
 
+        // монетка
+        mcp_server.AddTool(
+            "self.game.coin_flip",
+            "Flip a coin (heads or tails, орёл или решка). "
+            "Call this every time the user asks to flip a coin, toss a coin, "
+            "or play heads or tails. Returns 'heads' or 'tails'. "
+            "Announce the result to the user in their language.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                bool heads = (esp_random() & 1) != 0;
+                return std::string(heads ? "heads" : "tails");
+            });
+		//температура и влажность на датчике
         mcp_server.AddTool("self.sensor.get_room_climate",
             "Get current room temperature in Celsius and humidity in percent from the built-in sensor",
             PropertyList(), [this](const PropertyList &) -> ReturnValue {
@@ -79,6 +105,88 @@ class CustomBoard : public WifiBoard {
                     "{\"success\":true,\"temperature\":%.1f,\"humidity\":%.1f}", t, h);
                 return std::string(buf);
             });
+			
+			//бросить кубик
+			mcp_server.AddTool(
+    "self.game.dice",
+    "Roll dice. Use when the user asks to roll a die or dice. "
+    "sides is the number of sides (default 6), count is how many dice (default 1). "
+    "Announce the result in the user's language.",
+    PropertyList({
+        Property("sides", kPropertyTypeInteger, 6, 2, 100),
+        Property("count", kPropertyTypeInteger, 1, 1, 10)
+    }),
+    [this](const PropertyList &properties) -> ReturnValue {
+        int sides = properties["sides"].value<int>();
+        int count = properties["count"].value<int>();
+        int total = 0;
+        std::string rolls;
+        for (int i = 0; i < count; i++) {
+            int r = (esp_random() % sides) + 1;
+            total += r;
+            rolls += (i ? "," : "") + std::to_string(r);
+        }
+        return std::string("{\"rolls\":[") + rolls + "],\"total\":" + std::to_string(total) + "}";
+    });
+	//таймер
+	        mcp_server.AddTool("self.timer.set",
+            "Set a countdown timer. Call when the user asks to set a timer or remind after some time. "
+            "seconds is the total time in seconds (convert minutes and hours to seconds). "
+            "A new timer replaces the previous one. Confirm the time to the user.",
+            PropertyList({Property("seconds", kPropertyTypeInteger, 60, 1, 86400)}),
+            [this](const PropertyList &properties) -> ReturnValue {
+                int seconds = properties["seconds"].value<int>();
+                EnsureTimer();
+                esp_timer_stop(timer_handle_);
+                esp_timer_start_once(timer_handle_, (int64_t)seconds * 1000000);
+                timer_end_us_ = esp_timer_get_time() + (int64_t)seconds * 1000000;
+                return std::string("{\"success\":true,\"seconds\":") + std::to_string(seconds) + "}";
+            });
+
+        mcp_server.AddTool("self.timer.cancel",
+            "Cancel the running timer. Call when the user asks to cancel or stop the timer.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                if (timer_handle_) esp_timer_stop(timer_handle_);
+                timer_end_us_ = 0;
+                return std::string("{\"success\":true}");
+            });
+
+        mcp_server.AddTool("self.timer.left",
+            "Get how many seconds are left on the timer. Call when the user asks how much time is left.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                int64_t left_us = timer_end_us_ - esp_timer_get_time();
+                if (timer_end_us_ == 0 || left_us <= 0) {
+                    return std::string("{\"running\":false}");
+                }
+                return std::string("{\"running\":true,\"seconds_left\":") + std::to_string((int)(left_us / 1000000)) + "}";
+            });
+
+        mcp_server.AddTool("self.stopwatch.start",
+            "Start the stopwatch. Call when the user asks to start the stopwatch or start counting time.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                stopwatch_start_us_ = esp_timer_get_time();
+                stopwatch_running_ = true;
+                return std::string("{\"success\":true}");
+            });
+
+        mcp_server.AddTool("self.stopwatch.stop",
+            "Stop the stopwatch and get the elapsed time in seconds. "
+            "Call when the user asks to stop the stopwatch or asks how much time has passed. "
+            "Announce the time in minutes and seconds.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                if (!stopwatch_running_) {
+                    return std::string("{\"running\":false}");
+                }
+                stopwatch_running_ = false;
+                int elapsed = (int)((esp_timer_get_time() - stopwatch_start_us_) / 1000000);
+                return std::string("{\"elapsed_seconds\":") + std::to_string(elapsed) + "}";
+            });
+			
+	
     }
 
     void InitializeLcdDisplay() {
@@ -102,6 +210,18 @@ class CustomBoard : public WifiBoard {
         do {
             vTaskDelay(pdMS_TO_TICKS(10));
         } while (!gpio_get_level(VBAT_PWR_GPIO));
+    }
+	
+	    void EnsureTimer() {
+        if (timer_handle_) return;
+        esp_timer_create_args_t args = {};
+        args.callback = [](void *) {
+            Application::GetInstance().Schedule([]() {
+                Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+            });
+        };
+        args.name = "user_timer";
+        esp_timer_create(&args, &timer_handle_);
     }
 
     uint16_t BatterygetVoltage(void) {
