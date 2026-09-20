@@ -10,7 +10,7 @@
 #include "settings.h"
 #include "pixel_face.h"
 #include "display/display.h"
-
+#include "assets/lang_config.h"
 #define TAG "CustomLcdDisplay"
 
 #define BYTES_PER_PIXEL (LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565))
@@ -455,7 +455,12 @@ void CustomLcdDisplay::SetEmotion(const char* emotion) {
 
 void CustomLcdDisplay::SetStatus(const char* status) {
     ESP_LOGI(TAG, "SetStatus: %s", status);
-    DrawFace(FACE_LISTENING);
+ 
+    if (strcmp(status, Lang::Strings::LISTENING) == 0) {
+        DrawFace(FACE_LISTENING);
+    }
+    // Для остальных статусов (ожидание, подключение, говорю и т.п.)
+    // лицо не трогаем — им управляет SetEmotion.
 }
 void CustomLcdDisplay::SetupUI() {
     ESP_LOGI(TAG, "Custom SetupUI: skipping default widgets");

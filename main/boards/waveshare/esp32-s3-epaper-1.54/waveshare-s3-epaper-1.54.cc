@@ -1,3 +1,5 @@
+#include <cJSON.h>
+#include "system_info.h"
 #include <stdio.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
@@ -22,6 +24,136 @@
 
 #define TAG "waveshare_epaper_1_54"
 
+// ===== ПОГОДА (Open-Meteo, Лимассол, Кипр) =====
+// Вставить после блока с монеткой (self.game.coin_flip)
+ 
+// Координаты Лимассола, Кипр
+static constexpr double kWeatherLat = 34.7071;
+static constexpr double kWeatherLon = 33.0226;
+ 
+// Простейший кэш, чтобы не долбить API при каждом вопросе / каждом
+// обновлении заставки. Живёт 10 минут.
+struct WeatherCache {
+    std::string summary;      // готовая фраза для голоса
+    float temperature = 0.0f; // для заставки на экране
+    int weather_code = 0;     // код погоды Open-Meteo (для иконки)
+    int64_t fetched_at_ms = 0;
+    bool valid = false;
+};
+static WeatherCache s_weather_cache;
+static constexpr int64_t kWeatherCacheTtlMs = 10 * 60 * 1000; // 10 минут
+ 
+// Переводит weather_code Open-Meteo (WMO) в человекочитаемое описание
+static std::string WeatherCodeToText(int code) {
+    if (code == 0) return "ясно";
+    if (code == 1 || code == 2) return "малооблачно";
+    if (code == 3) return "пасмурно";
+    if (code == 45 || code == 48) return "туман";
+    if (code >= 51 && code <= 57) return "морось";
+    if (code >= 61 && code <= 67) return "дождь";
+    if (code >= 71 && code <= 77) return "снег";
+    if (code >= 80 && code <= 82) return "ливень";
+    if (code >= 85 && code <= 86) return "снегопад";
+    if (code >= 95 && code <= 99) return "гроза";
+    return "неизвестно";
+}
+ 
+// Делает запрос к Open-Meteo и обновляет кэш.
+// Возвращает true при успехе.
+static bool FetchWeather() {
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+             "&current=temperature_2m,weather_code&timezone=auto",
+             kWeatherLat, kWeatherLon);
+ 
+    auto& board = Board::GetInstance();
+    auto network = board.GetNetwork();
+    auto http = network->CreateHttp(0);
+    if (http == nullptr) {
+        ESP_LOGE("Weather", "Failed to create http client");
+        return false;
+    }
+    http->SetHeader("User-Agent", SystemInfo::GetUserAgent());
+ 
+    if (auto opened = http->Open("GET", url); !opened) {
+        ESP_LOGE("Weather", "Failed to open HTTP connection: %s", opened.error().ToString().c_str());
+        return false;
+    }
+ 
+    auto status_code = http->GetStatusCode();
+    if (!status_code) {
+        ESP_LOGE("Weather", "Failed to read HTTP status: %s", status_code.error().ToString().c_str());
+        http->Close();
+        return false;
+    }
+    if (*status_code != 200) {
+        ESP_LOGE("Weather", "Open-Meteo returned status code: %d", *status_code);
+        http->Close();
+        return false;
+    }
+ 
+    std::string body = http->ReadAll();
+    http->Close();
+ 
+    if (body.empty()) {
+        ESP_LOGE("Weather", "Empty response from Open-Meteo");
+        return false;
+    }
+ 
+    cJSON *root = cJSON_Parse(body.c_str());
+    if (root == nullptr) {
+        ESP_LOGE("Weather", "Failed to parse JSON");
+        return false;
+    }
+ 
+    cJSON *current = cJSON_GetObjectItem(root, "current");
+    if (current == nullptr) {
+        ESP_LOGE("Weather", "No 'current' field in response");
+        cJSON_Delete(root);
+        return false;
+    }
+ 
+    cJSON *temp = cJSON_GetObjectItem(current, "temperature_2m");
+    cJSON *code = cJSON_GetObjectItem(current, "weather_code");
+    if (temp == nullptr || code == nullptr) {
+        cJSON_Delete(root);
+        return false;
+    }
+ 
+    float temperature = (float)temp->valuedouble;
+    int weather_code = code->valueint;
+    std::string desc = WeatherCodeToText(weather_code);
+ 
+    char summary[128];
+    snprintf(summary, sizeof(summary),
+             "В Лимассоле сейчас %s, температура %.0f градусов",
+             desc.c_str(), temperature);
+ 
+    s_weather_cache.summary = summary;
+    s_weather_cache.temperature = temperature;
+    s_weather_cache.weather_code = weather_code;
+    s_weather_cache.fetched_at_ms = esp_timer_get_time() / 1000;
+    s_weather_cache.valid = true;
+ 
+    cJSON_Delete(root);
+    return true;
+}
+ 
+// Возвращает актуальные данные о погоде, обновляя кэш при необходимости.
+// Используется и голосовым MCP tool, и заставкой на экране (этап 2, п.2).
+static bool GetWeather(WeatherCache &out) {
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (!s_weather_cache.valid ||
+        (now_ms - s_weather_cache.fetched_at_ms) > kWeatherCacheTtlMs) {
+        if (!FetchWeather() && !s_weather_cache.valid) {
+            return false; // не было ни разу удачного запроса
+        }
+    }
+    out = s_weather_cache;
+    return true;
+}
+
 class CustomBoard : public WifiBoard {
   private:
     i2c_master_bus_handle_t   i2c_bus_;
@@ -38,7 +170,11 @@ class CustomBoard : public WifiBoard {
     int64_t timer_end_us_ = 0;
     int64_t stopwatch_start_us_ = 0;
     bool stopwatch_running_ = false;
-
+	esp_timer_handle_t autolisten_timer_ = nullptr;
+    int autolisten_retries_ = 0;
+	esp_timer_handle_t led_timer_ = nullptr;
+    bool led_blink_on_ = false;
+	int idle_blink_tick_ = 0;
 	
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {};
@@ -53,7 +189,7 @@ class CustomBoard : public WifiBoard {
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
 		
 	}
-
+	//кнопки
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto &app = Application::GetInstance();
@@ -74,10 +210,70 @@ class CustomBoard : public WifiBoard {
         });
     }
 
+    void UpdateListenLed() {
+        if (power_ == nullptr) {
+            return;
+        }
+ 
+        auto& app = Application::GetInstance();
+ 
+        if (app.GetDeviceState() == kDeviceStateListening) {
+            idle_blink_tick_ = 0; // сбрасываем счётчик "сердцебиения"
+            led_blink_on_ = !led_blink_on_;
+            if (led_blink_on_) {
+                power_->LedOn();
+            } else {
+                power_->LedOff();
+            }
+            return;
+        }
+ 
+        // Не слушаем. Если светодиод остался включённым после мигания
+        // прослушки, гасим его один раз.
+        if (led_blink_on_) {
+            led_blink_on_ = false;
+            power_->LedOff();
+            idle_blink_tick_ = 0;
+            return;
+        }
+ 
+        // "Сердцебиение": таймер тикает каждые 400 мс, значит 50 тиков
+        // это 20 секунд. На 50-м тике коротко мигаем (один тик, 400 мс)
+        // и сбрасываем счётчик.
+        idle_blink_tick_++;
+        if (idle_blink_tick_ >= 50) {
+            idle_blink_tick_ = 0;
+            power_->LedOn();
+        } else if (idle_blink_tick_ == 1) {
+            // Тик сразу после вспышки — гасим её, вспышка длится ровно
+            // один период таймера, 400 мс.
+            power_->LedOff();
+        }
+    }
+ 
+    // Запускает таймер мигания. Период 400 мс даёт спокойное,
+    // заметное мигание. Меньше значение, быстрее моргает.
+    void StartListenLed() {
+        esp_timer_create_args_t args = {};
+        args.callback = [](void* arg) {
+            static_cast<CustomBoard*>(arg)->UpdateListenLed();
+        };
+        args.arg = this;
+        args.dispatch_method = ESP_TIMER_TASK;
+        args.name = "listen_led";
+        args.skip_unhandled_events = true;
+ 
+        if (esp_timer_create(&args, &led_timer_) != ESP_OK) {
+            ESP_LOGE(TAG, "Listen LED: failed to create timer");
+            return;
+        }
+        esp_timer_start_periodic(led_timer_, 400 * 1000);
+    }
+	
         void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
 
-
+		//wifi
         mcp_server.AddTool("self.disp.network", "Reconfigure WiFi connection", PropertyList(), [this](const PropertyList &) -> ReturnValue {
             EnterWifiConfigMode();
             return true;
@@ -92,9 +288,29 @@ class CustomBoard : public WifiBoard {
             "Announce the result to the user in their language.",
             PropertyList(),
             [this](const PropertyList &) -> ReturnValue {
+                Application::GetInstance().PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+                vTaskDelay(pdMS_TO_TICKS(2000));
                 bool heads = (esp_random() & 1) != 0;
                 return std::string(heads ? "heads" : "tails");
             });
+			
+		// погода
+		mcp_server.AddTool(
+    "self.weather.get_current",
+    "Get current weather in Limassol, Cyprus (Лимассол, Кипр). "
+    "Call this every time the user asks about weather, temperature, "
+    "what's it like outside, погода, температура на улице. "
+    "Returns a short description of current conditions and temperature. "
+    "Announce the result to the user in their language.",
+    PropertyList(),
+    [this](const PropertyList &) -> ReturnValue {
+        WeatherCache w;
+        if (!GetWeather(w)) {
+            return std::string("Не удалось получить данные о погоде, попробуйте позже");
+        }
+        return w.summary;
+    });
+			
 		//температура и влажность на датчике
         mcp_server.AddTool("self.sensor.get_room_climate",
             "Get current room temperature in Celsius and humidity in percent from the built-in sensor",
@@ -131,6 +347,7 @@ class CustomBoard : public WifiBoard {
         }
         return std::string("{\"rolls\":[") + rolls + "],\"total\":" + std::to_string(total) + "}";
     });
+	
 	//таймер
 	        mcp_server.AddTool("self.timer.set",
             "Set a countdown timer. Call when the user asks to set a timer or remind after some time. "
@@ -189,7 +406,47 @@ class CustomBoard : public WifiBoard {
                 return std::string("{\"elapsed_seconds\":") + std::to_string(elapsed) + "}";
             });
 			
-	
+			// выключение по голосу
+mcp_server.AddTool(
+    "self.power.shutdown",
+    "Turn off the device completely (shut down, power off). "
+    "Call this ONLY when the user gives an explicit command to turn off, "
+    "shut down, or power off the device — for example \"выключись\", "
+    "\"выключи себя\", \"отключись\", \"turn off\", \"shut down\". "
+    "end the conversation, they don't mean shut down. "
+    "Before calling this, say goodbye to the user out loud in their language, "
+    "because the device will power off a couple of seconds after this call "
+    "and won't be able to speak again until turned back on.",
+    PropertyList(),
+    [this](const PropertyList &) -> ReturnValue {
+        display_->DrawFace(FACE_DEAD);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        power_->PowerAudioOff();
+        power_->PowerEpdOff();
+        power_->VbatPowerOff();
+        return std::string("{\"success\":true}");
+    });
+ 
+	// остановить прослушивание по голосу
+mcp_server.AddTool(
+    "self.chat.stop_listening",
+    "Stop listening / pause the conversation. "
+    "Call this when the user explicitly asks to stop listening, pause, "
+    "be quiet, or stop the conversation — for example \"хватит слушать\", "
+    "\"перестань слушать\", \"остановись\", \"stop listening\", \"pause\". "
+    "Do NOT call this for a casual goodbye like \"пока\" or \"bye\" unless "
+    "the user clearly wants listening to stop, not just to end the current reply. "
+    "This does not turn off the device, only stops it from listening until "
+    "the user presses the button or gives a new command.",
+    PropertyList(),
+    [this](const PropertyList &) -> ReturnValue {
+        auto& app = Application::GetInstance();
+        auto state = app.GetDeviceState();
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            app.ToggleChatState();
+        }
+        return std::string("{\"success\":true}");
+    });
     }
 
     void InitializeLcdDisplay() {
@@ -225,6 +482,49 @@ class CustomBoard : public WifiBoard {
         args.arg = this;
         args.name = "user_timer";
         esp_timer_create(&args, &timer_handle_);
+    }
+
+// Проверяет, готово ли устройство, и если да, запускает прослушку.
+    // Вызывается таймером раз в секунду.
+    void TryAutoListen() {
+        auto& app = Application::GetInstance();
+        autolisten_retries_++;
+ 
+        // kDeviceStateIdle означает: загрузка закончена, Wi-Fi поднят,
+        // протокол готов, устройство просто ждёт команды.
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            ESP_LOGI(TAG, "Auto listen: device ready, starting chat");
+            esp_timer_stop(autolisten_timer_);
+            app.ToggleChatState();
+            return;
+        }
+ 
+        // Если за 30 секунд так и не дождались готовности (нет Wi-Fi,
+        // режим настройки и т.п.), прекращаем попытки, чтобы таймер
+        // не крутился вечно.
+        if (autolisten_retries_ >= 30) {
+            ESP_LOGW(TAG, "Auto listen: device not ready after 30s, giving up");
+            esp_timer_stop(autolisten_timer_);
+        }
+    }
+ 
+    // Запускает периодическую проверку готовности устройства.
+    void StartAutoListen() {
+        esp_timer_create_args_t args = {};
+        args.callback = [](void* arg) {
+            static_cast<CustomBoard*>(arg)->TryAutoListen();
+        };
+        args.arg = this;
+        args.dispatch_method = ESP_TIMER_TASK;
+        args.name = "autolisten";
+        args.skip_unhandled_events = true;
+ 
+        if (esp_timer_create(&args, &autolisten_timer_) != ESP_OK) {
+            ESP_LOGE(TAG, "Auto listen: failed to create timer");
+            return;
+        }
+        // Раз в секунду, первая проверка через секунду после старта.
+        esp_timer_start_periodic(autolisten_timer_, 1000 * 1000);
     }
 
     void StartAlarm() {
@@ -371,6 +671,8 @@ class CustomBoard : public WifiBoard {
         InitializeButtons();
         InitializeTools();
         InitializeLcdDisplay();
+		StartAutoListen();
+		StartListenLed();
     }
 
     virtual AudioCodec *GetAudioCodec() override {
@@ -392,3 +694,4 @@ class CustomBoard : public WifiBoard {
 };
 
 DECLARE_BOARD(CustomBoard);
+
