@@ -175,6 +175,12 @@ class CustomBoard : public WifiBoard {
 	esp_timer_handle_t led_timer_ = nullptr;
     bool led_blink_on_ = false;
 	int idle_blink_tick_ = 0;
+	int idle_face_tick_ = 0;
+    int idle_blink_in_ = 30;     // через сколько тиков следующее моргание
+    int idle_bored_in_ = 300;    // через сколько тиков следующая "скука"
+    bool idle_bored_active_ = false;
+	esp_timer_handle_t boot_timer_ = nullptr;
+    int boot_frame_ = 0;
 	
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {};
@@ -200,14 +206,17 @@ class CustomBoard : public WifiBoard {
             }
             app.ToggleChatState();
         });
-
+		
         pwr_button_.OnLongPress([this]() {
-            display_->DrawFace(FACE_DEAD);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            power_->PowerAudioOff();
-            power_->PowerEpdOff();
-            power_->VbatPowerOff();
-        });
+        display_->SetShuttingDown(true);
+        display_->DrawFace(FACE_SAD);
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        display_->DrawFace(FACE_DEAD);
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        power_->PowerAudioOff();
+        power_->PowerEpdOff();
+        power_->VbatPowerOff();
+    });
     }
 
     void UpdateListenLed() {
@@ -251,13 +260,52 @@ class CustomBoard : public WifiBoard {
         }
     }
  
+  void UpdateIdleFace() {
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle ||
+            display_->GetFaceMode() != FaceMode::kIdle) {
+            idle_face_tick_ = 0;
+            idle_bored_active_ = false;
+            return;
+        }
+
+        idle_face_tick_++;
+
+        // скучающее лицо держим примерно полторы секунды, потом обратно
+        if (idle_bored_active_) {
+            if (idle_face_tick_ % 4 == 0) {
+                idle_bored_active_ = false;
+                display_->DrawFace(FACE_IDLE);
+                idle_bored_in_ = idle_face_tick_ + 60 + (esp_random() % 90);
+            }
+            return;
+        }
+
+        // моргание, короткая вспышка на один тик
+        if (idle_face_tick_ == idle_blink_in_) {
+            display_->DrawFace(FACE_IDLE_BLINK);
+        } else if (idle_face_tick_ == idle_blink_in_ + 1) {
+            display_->DrawFace(FACE_IDLE);
+            idle_blink_in_ = idle_face_tick_ + 10 + (esp_random() % 15);
+        }
+
+        // скучающее лицо, редкое событие
+        if (idle_face_tick_ == idle_bored_in_) {
+            idle_bored_active_ = true;
+            display_->DrawFace(FACE_IDLE_BORED);
+        }
+    }
+ 
+ 
     // Запускает таймер мигания. Период 400 мс даёт спокойное,
     // заметное мигание. Меньше значение, быстрее моргает.
     void StartListenLed() {
         esp_timer_create_args_t args = {};
-        args.callback = [](void* arg) {
-            static_cast<CustomBoard*>(arg)->UpdateListenLed();
-        };
+       args.callback = [](void* arg) {
+    auto* self = static_cast<CustomBoard*>(arg);
+    self->UpdateListenLed();
+    self->UpdateIdleFace();  
+};
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
         args.name = "listen_led";
@@ -418,9 +466,12 @@ mcp_server.AddTool(
     "because the device will power off a couple of seconds after this call "
     "and won't be able to speak again until turned back on.",
     PropertyList(),
-    [this](const PropertyList &) -> ReturnValue {
+      [this](const PropertyList &) -> ReturnValue {
+        display_->SetShuttingDown(true);
+        display_->DrawFace(FACE_SAD);
+        vTaskDelay(pdMS_TO_TICKS(1500));
         display_->DrawFace(FACE_DEAD);
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1500));
         power_->PowerAudioOff();
         power_->PowerEpdOff();
         power_->VbatPowerOff();
@@ -507,6 +558,48 @@ mcp_server.AddTool(
             esp_timer_stop(autolisten_timer_);
         }
     }
+ //экран загрузки, неблокирующий: кадры идут по таймеру,
+ //параллельно с подключением к сети
+ static constexpr int kBootFrameMs = 2000;   // 6 кадров, всего 12 секунд
+
+ void ShowBootProgress() {
+    display_->SetBooting(true);
+    boot_frame_ = 0;
+    display_->DrawFace(FACE_BOOT_0);
+
+    esp_timer_create_args_t args = {};
+    args.callback = [](void* arg) {
+        static_cast<CustomBoard*>(arg)->NextBootFrame();
+    };
+    args.arg = this;
+    args.dispatch_method = ESP_TIMER_TASK;
+    args.name = "boot_anim";
+    args.skip_unhandled_events = true;
+
+    if (esp_timer_create(&args, &boot_timer_) != ESP_OK) {
+        ESP_LOGE(TAG, "Boot anim: failed to create timer");
+        display_->SetBooting(false);
+        return;
+    }
+    esp_timer_start_periodic(boot_timer_, kBootFrameMs * 1000);
+}
+
+ void NextBootFrame() {
+    static const int frames[] = {
+        FACE_BOOT_0, FACE_BOOT_1, FACE_BOOT_2,
+        FACE_BOOT_3, FACE_BOOT_4, FACE_BOOT_5
+    };
+    const int count = sizeof(frames) / sizeof(frames[0]);
+
+    boot_frame_++;
+    if (boot_frame_ >= count) {
+        esp_timer_stop(boot_timer_);
+        display_->SetBooting(false);
+        display_->RequestFace();
+        return;
+    }
+    display_->DrawFace(frames[boot_frame_]);
+}
  
     // Запускает периодическую проверку готовности устройства.
     void StartAutoListen() {
@@ -671,8 +764,9 @@ mcp_server.AddTool(
         InitializeButtons();
         InitializeTools();
         InitializeLcdDisplay();
-		StartAutoListen();
-		StartListenLed();
+        ShowBootProgress();
+        StartAutoListen();
+        StartListenLed();
     }
 
     virtual AudioCodec *GetAudioCodec() override {

@@ -11,6 +11,7 @@
 #include "pixel_face.h"
 #include "display/display.h"
 #include "assets/lang_config.h"
+#include "application.h"
 #define TAG "CustomLcdDisplay"
 
 #define BYTES_PER_PIXEL (LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565))
@@ -64,17 +65,7 @@ const uint8_t WF_PARTIAL_1IN54_0[159] =
 
 void CustomLcdDisplay::lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p) {
     assert(disp != NULL);
-    CustomLcdDisplay *driver = (CustomLcdDisplay *) lv_display_get_user_data(disp);
-    uint16_t         *buffer = (uint16_t *) color_p;
-    driver->EPD_Clear();
-    for (int y = area->y1; y <= area->y2; y++) {
-        for (int x = area->x1; x <= area->x2; x++) {
-            uint8_t color = (*buffer < 0x7fff) ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE;
-            driver->EPD_DrawColorPixel(x, y, color);
-            buffer++;
-        }
-    }
-    driver->EPD_DisplayPart();
+    ESP_LOGW(TAG, "lvgl_flush_cb fired: %d,%d - %d,%d", area->x1, area->y1, area->x2, area->y2);
     lv_disp_flush_ready(disp);
 }
 
@@ -387,6 +378,12 @@ void CustomLcdDisplay::EPD_DisplayPart() {
     assert(buffer);
     writeBytes(buffer, 5000);
     EPD_TurnOnDisplayPart();
+
+    // Запоминаем показанный кадр как "старый". Без этого контроллер
+    // считает разницу от устаревшего изображения, чёрные пиксели
+    // никогда не стираются и кадры накладываются друг на друга.
+    EPD_SendCommand(0x26);
+    writeBytes(buffer, 5000);
 }
 
 void CustomLcdDisplay::EPD_DrawColorPixel(uint16_t x, uint16_t y, uint8_t color) {
@@ -410,11 +407,11 @@ void CustomLcdDisplay::DrawFace(int face_type) {
     if (face_type < 0 || face_type >= FACE_COUNT) {
         return;
     }
-	
-    if (face_type == current_face_) {
-        return;  // уже нарисовано, не трогаем экран
-    }
+
+    ESP_LOGW(TAG, "DrawFace: %d (mode=%d)", face_type, (int)face_mode_);
+
     current_face_ = face_type;
+  
 	
     const int cell = Width / FACE_GRID;   // размер одного "пикселя" лица
     const int offset = (Width - cell * FACE_GRID) / 2;
@@ -440,28 +437,130 @@ void CustomLcdDisplay::DrawFace(int face_type) {
     EPD_DisplayPart();
 }
 
-void CustomLcdDisplay::SetEmotion(const char* emotion) {
-    ESP_LOGI(TAG, "SetEmotion: %s", emotion);
-
-    if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "laughing") == 0 ||
-        strcmp(emotion, "funny") == 0 || strcmp(emotion, "loving") == 0) {
-        DrawFace(FACE_HAPPY);
-    } else if (strcmp(emotion, "thinking") == 0) {
-        DrawFace(FACE_THINKING);
-    } else {
-        DrawFace(FACE_IDLE);
-    }
-}
+static constexpr int kEmotionRevertMs = 1500;
 
 void CustomLcdDisplay::SetStatus(const char* status) {
     ESP_LOGI(TAG, "SetStatus: %s", status);
- 
+    if (face_mode_ == FaceMode::kShuttingDown) return;
+    if (booting_) return;
+
     if (strcmp(status, Lang::Strings::LISTENING) == 0) {
-        DrawFace(FACE_LISTENING);
+        if (mouth_timer_) esp_timer_stop(mouth_timer_);
+
+        // Эмоция, пришедшая во время речи, показывается теперь, когда
+        // рот уже не двигается, и гаснет через полторы секунды.
+        if (pending_emotion_ >= 0) {
+            emotion_face_ = pending_emotion_;
+            pending_emotion_ = -1;
+            face_mode_ = FaceMode::kEmotion;
+            RequestFace();
+
+            if (emotion_revert_timer_ == nullptr) {
+                esp_timer_create_args_t args = {};
+                args.callback = [](void* arg) {
+                    static_cast<CustomLcdDisplay*>(arg)->RevertToSpeakingFace();
+                };
+                args.arg = this;
+                args.dispatch_method = ESP_TIMER_TASK;
+                args.name = "emotion_revert";
+                esp_timer_create(&args, &emotion_revert_timer_);
+            } else {
+                esp_timer_stop(emotion_revert_timer_);
+            }
+            esp_timer_start_once(emotion_revert_timer_, (int64_t)kEmotionRevertMs * 1000);
+        } else {
+            if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
+            face_mode_ = FaceMode::kListening;
+            RequestFace();
+        }
+    } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+        if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
+        pending_emotion_ = -1;
+        mouth_open_ = true;
+        face_mode_ = FaceMode::kSpeaking;
+        RequestFace();
+
+        if (mouth_timer_ == nullptr) {
+            esp_timer_create_args_t args = {};
+            args.callback = [](void* arg) {
+                static_cast<CustomLcdDisplay*>(arg)->ToggleMouth();
+            };
+            args.arg = this;
+            args.dispatch_method = ESP_TIMER_TASK;
+            args.name = "mouth_anim";
+            esp_timer_create(&args, &mouth_timer_);
+        }
+        esp_timer_stop(mouth_timer_);
+        esp_timer_start_periodic(mouth_timer_, 700 * 1000);
+    } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
+        if (mouth_timer_) esp_timer_stop(mouth_timer_);
+        if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
+        pending_emotion_ = -1;
+        face_mode_ = FaceMode::kIdle;
+        RequestFace();
+    } else {
+        if (mouth_timer_) esp_timer_stop(mouth_timer_);
     }
-    // Для остальных статусов (ожидание, подключение, говорю и т.п.)
-    // лицо не трогаем — им управляет SetEmotion.
 }
+
+void CustomLcdDisplay::ToggleMouth() {
+    if (face_mode_ != FaceMode::kSpeaking) {
+        if (mouth_timer_) esp_timer_stop(mouth_timer_);
+        return;
+    }
+    mouth_open_ = !mouth_open_;
+    RequestFace();
+}
+
+void CustomLcdDisplay::RequestFace() {
+    switch (face_mode_) {
+        case FaceMode::kShuttingDown:
+            return;
+        case FaceMode::kBooting:
+            return;
+        case FaceMode::kSpeaking:
+            DrawFace(mouth_open_ ? FACE_SPEAKING : FACE_SPEAKING2);
+            return;
+        case FaceMode::kListening:
+            DrawFace(FACE_LISTENING);
+            return;
+        case FaceMode::kEmotion:
+            DrawFace(emotion_face_);
+            return;
+        case FaceMode::kIdle:
+            DrawFace(FACE_IDLE);
+            return;
+    }
+}
+
+void CustomLcdDisplay::RevertToSpeakingFace() {
+    if (face_mode_ == FaceMode::kEmotion) {
+        face_mode_ = FaceMode::kListening;
+        RequestFace();
+    }
+}
+
+void CustomLcdDisplay::SetEmotion(const char* emotion) {
+    ESP_LOGI(TAG, "SetEmotion: %s", emotion);
+    if (face_mode_ == FaceMode::kShuttingDown) return;
+    if (booting_) return;
+
+    int face = -1;
+    if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "laughing") == 0 ||
+        strcmp(emotion, "funny") == 0 || strcmp(emotion, "loving") == 0) {
+        face = FACE_HAPPY;
+    } else if (strcmp(emotion, "thinking") == 0) {
+        face = FACE_THINKING;
+    }
+
+    // "neutral" и прочие неопознанные эмоции лицо не трогают.
+    if (face < 0) return;
+
+    // Во время речи эмоцию не показываем, чтобы не рвать анимацию рта.
+    // Запоминаем и покажем, когда он замолчит.
+    pending_emotion_ = face;
+}
+
 void CustomLcdDisplay::SetupUI() {
     ESP_LOGI(TAG, "Custom SetupUI: skipping default widgets");
     Display::SetupUI();   // только помечаем, что UI готов
