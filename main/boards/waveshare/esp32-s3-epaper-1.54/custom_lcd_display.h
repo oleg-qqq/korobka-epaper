@@ -94,7 +94,8 @@ FaceMode face_mode_ = FaceMode::kIdle;
      esp_timer_handle_t emotion_revert_timer_ = nullptr;
      int emotion_face_ = FACE_HAPPY;   // какую именно эмоцию сейчас показываем
 	 int pending_emotion_ = -1;   // эмоция, отложенная до конца речи
-
+	 bool mouth_started_ = false;
+	 
     void set_cs_1(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,1);}
     void set_cs_0(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,0);}
     void set_dc_1(){gpio_set_level((gpio_num_t)lcd_spi_data.dc,1);}

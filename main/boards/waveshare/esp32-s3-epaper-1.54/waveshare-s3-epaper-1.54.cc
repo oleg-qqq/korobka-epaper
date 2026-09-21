@@ -21,7 +21,7 @@
 #include <esp_random.h>
 #include <string>
 #include "assets/lang_config.h"
-
+#include <esp_wifi.h>
 #define TAG "waveshare_epaper_1_54"
 
 // ===== ПОГОДА (Open-Meteo, Лимассол, Кипр) =====
@@ -181,6 +181,12 @@ class CustomBoard : public WifiBoard {
     bool idle_bored_active_ = false;
 	esp_timer_handle_t boot_timer_ = nullptr;
     int boot_frame_ = 0;
+	int wifi_check_tick_ = 0;
+    int wifi_warn_cooldown_ = 0;
+    int wifi_warn_hold_ = 0;
+	int idle_anim_hold_ = 0;
+    bool idle_double_blink_ = false;
+	bool wifi_warn_frame_ = false;
 	
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {};
@@ -225,6 +231,7 @@ class CustomBoard : public WifiBoard {
         }
  
         auto& app = Application::GetInstance();
+	
  
         if (app.GetDeviceState() == kDeviceStateListening) {
             idle_blink_tick_ = 0; // сбрасываем счётчик "сердцебиения"
@@ -260,52 +267,140 @@ class CustomBoard : public WifiBoard {
         }
     }
  
-  void UpdateIdleFace() {
+ void UpdateIdleFace() {
+        if (wifi_warn_hold_ > 0) return;
+
         auto& app = Application::GetInstance();
         if (app.GetDeviceState() != kDeviceStateIdle ||
             display_->GetFaceMode() != FaceMode::kIdle) {
             idle_face_tick_ = 0;
             idle_bored_active_ = false;
+            idle_anim_hold_ = 0;
+            idle_double_blink_ = false;
+            idle_blink_in_ = 8 + (esp_random() % 12);
+            idle_bored_in_ = 150 + (esp_random() % 150);
             return;
         }
 
         idle_face_tick_++;
 
-        // скучающее лицо держим примерно полторы секунды, потом обратно
+        // скучающее лицо держим подольше
         if (idle_bored_active_) {
-            if (idle_face_tick_ % 4 == 0) {
+            idle_anim_hold_--;
+            if (idle_anim_hold_ <= 0) {
                 idle_bored_active_ = false;
                 display_->DrawFace(FACE_IDLE);
-                idle_bored_in_ = idle_face_tick_ + 60 + (esp_random() % 90);
+                idle_bored_in_ = idle_face_tick_ + 150 + (esp_random() % 150);
+                idle_blink_in_ = idle_face_tick_ + 10 + (esp_random() % 15);
             }
             return;
         }
 
-        // моргание, короткая вспышка на один тик
-        if (idle_face_tick_ == idle_blink_in_) {
-            display_->DrawFace(FACE_IDLE_BLINK);
-        } else if (idle_face_tick_ == idle_blink_in_ + 1) {
-            display_->DrawFace(FACE_IDLE);
-            idle_blink_in_ = idle_face_tick_ + 10 + (esp_random() % 15);
+        // идёт короткое движение, ждём его окончания
+        if (idle_anim_hold_ > 0) {
+            idle_anim_hold_--;
+            if (idle_anim_hold_ == 0) {
+                display_->DrawFace(FACE_IDLE);
+                if (idle_double_blink_) {
+                    idle_double_blink_ = false;
+                    idle_blink_in_ = idle_face_tick_ + 2;   // второе моргание сразу
+                } else {
+                    idle_blink_in_ = idle_face_tick_ + 10 + (esp_random() % 15);
+                }
+            }
+            return;
+        }
+
+        // пора показать очередное движение, выбираем случайно
+        if (idle_face_tick_ >= idle_blink_in_) {
+            int r = esp_random() % 12;
+            if (r < 5) {
+                display_->DrawFace(FACE_IDLE_BLINK);
+                idle_anim_hold_ = 1;
+            } else if (r < 7) {
+                display_->DrawFace(FACE_IDLE_BLINK);
+                idle_anim_hold_ = 1;
+                idle_double_blink_ = true;
+            } else if (r == 7) {
+                display_->DrawFace(FACE_IDLE_WINK_L);
+                idle_anim_hold_ = 2;
+            } else if (r == 8) {
+                display_->DrawFace(FACE_IDLE_WINK_R);
+                idle_anim_hold_ = 2;
+            } else if (r <= 10) {
+                display_->DrawFace(FACE_IDLE_LOOK_L);
+                idle_anim_hold_ = 3;
+            } else {
+                display_->DrawFace(FACE_IDLE_LOOK_R);
+                idle_anim_hold_ = 3;
+            }
+            return;
         }
 
         // скучающее лицо, редкое событие
-        if (idle_face_tick_ == idle_bored_in_) {
+        if (idle_face_tick_ >= idle_bored_in_) {
             idle_bored_active_ = true;
+            idle_anim_hold_ = 4;
             display_->DrawFace(FACE_IDLE_BORED);
         }
     }
  
  
+    // Следит за уровнем сигнала Wi-Fi. Если он слабый, ненадолго
+    // показывает лицо с иконкой сигнала, но только в простое и не
+    // чаще раза в пять минут, чтобы не надоедать.
+   void CheckWifiSignal() {
+        if (wifi_warn_cooldown_ > 0) wifi_warn_cooldown_--;
+
+        
+        // держим предупреждение на экране, чередуя два кадра
+        if (wifi_warn_hold_ > 0) {
+            wifi_warn_hold_--;
+            if (wifi_warn_hold_ == 0) {
+                display_->RequestFace();
+                return;
+            }
+            // меняем кадр каждые два тика, это восемьсот миллисекунд
+            if (wifi_warn_hold_ % 2 == 0) {
+                wifi_warn_frame_ = !wifi_warn_frame_;
+                display_->DrawFace(wifi_warn_frame_ ? FACE_WIFI_WEAK : FACE_WIFI_WEAK2);
+            }
+            return;
+        }
+
+        // проверяем раз в тридцать секунд
+        wifi_check_tick_++;
+        if (wifi_check_tick_ < 75) return;
+        wifi_check_tick_ = 0;
+
+        // только в простое, чтобы не лезть посреди разговора
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) return;
+        if (display_->GetFaceMode() != FaceMode::kIdle) return;
+        if (wifi_warn_cooldown_ > 0) return;
+
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;
+        ESP_LOGI(TAG, "WiFi RSSI: %d", ap.rssi);
+        if (ap.rssi > -80) return;
+
+        wifi_warn_frame_ = true;
+        display_->DrawFace(FACE_WIFI_WEAK);
+        wifi_warn_hold_ = 9;         // около трёх с половиной секунд
+        wifi_warn_cooldown_ = 750;   // не чаще раза в пять минут
+    }
+	
+	
     // Запускает таймер мигания. Период 400 мс даёт спокойное,
     // заметное мигание. Меньше значение, быстрее моргает.
     void StartListenLed() {
         esp_timer_create_args_t args = {};
-       args.callback = [](void* arg) {
-    auto* self = static_cast<CustomBoard*>(arg);
-    self->UpdateListenLed();
-    self->UpdateIdleFace();  
-};
+          args.callback = [](void* arg) {
+            auto* self = static_cast<CustomBoard*>(arg);
+            self->UpdateListenLed();
+            self->UpdateIdleFace();
+            self->CheckWifiSignal();
+        };
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
         args.name = "listen_led";
@@ -498,6 +593,8 @@ mcp_server.AddTool(
         }
         return std::string("{\"success\":true}");
     });
+	  
+	
     }
 
     void InitializeLcdDisplay() {
@@ -543,10 +640,10 @@ mcp_server.AddTool(
  
         // kDeviceStateIdle означает: загрузка закончена, Wi-Fi поднят,
         // протокол готов, устройство просто ждёт команды.
-        if (app.GetDeviceState() == kDeviceStateIdle) {
-            ESP_LOGI(TAG, "Auto listen: device ready, starting chat");
+               if (app.GetDeviceState() == kDeviceStateIdle) {
+            ESP_LOGI(TAG, "Auto listen: device ready, saying hello");
             esp_timer_stop(autolisten_timer_);
-            app.ToggleChatState();
+            app.WakeWordInvoke("Ты очнулся ото сна и готов"); //Говорит после пробуждения
             return;
         }
  
@@ -560,7 +657,7 @@ mcp_server.AddTool(
     }
  //экран загрузки, неблокирующий: кадры идут по таймеру,
  //параллельно с подключением к сети
- static constexpr int kBootFrameMs = 2000;   // 6 кадров, всего 12 секунд
+ static constexpr int kBootFrameMs = 2000;   // 6 кадров, всего 12 секунд - ВРЕМЯ ЭКРАНА ЗАГРУЗКИ
 
  void ShowBootProgress() {
     display_->SetBooting(true);

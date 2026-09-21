@@ -65,7 +65,6 @@ const uint8_t WF_PARTIAL_1IN54_0[159] =
 
 void CustomLcdDisplay::lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p) {
     assert(disp != NULL);
-    ESP_LOGW(TAG, "lvgl_flush_cb fired: %d,%d - %d,%d", area->x1, area->y1, area->x2, area->y2);
     lv_disp_flush_ready(disp);
 }
 
@@ -408,7 +407,7 @@ void CustomLcdDisplay::DrawFace(int face_type) {
         return;
     }
 
-    ESP_LOGW(TAG, "DrawFace: %d (mode=%d)", face_type, (int)face_mode_);
+   
 
     current_face_ = face_type;
   
@@ -420,6 +419,9 @@ void CustomLcdDisplay::DrawFace(int face_type) {
 
     for (int row = 0; row < FACE_GRID; row++) {
         const char* line = kFaces[face_type][row];
+        if (line == nullptr) {
+            continue;
+        }
         for (int col = 0; col < FACE_GRID; col++) {
             if (line[col] != '#') {
                 continue;
@@ -438,6 +440,8 @@ void CustomLcdDisplay::DrawFace(int face_type) {
 }
 
 static constexpr int kEmotionRevertMs = 1500;
+static constexpr int kMouthStartDelayMs = 600;   // подождать, пока пойдёт звук
+static constexpr int kMouthPeriodMs = 700;       // темп открывания рта
 
 void CustomLcdDisplay::SetStatus(const char* status) {
     ESP_LOGI(TAG, "SetStatus: %s", status);
@@ -473,10 +477,11 @@ void CustomLcdDisplay::SetStatus(const char* status) {
             face_mode_ = FaceMode::kListening;
             RequestFace();
         }
-    } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+        } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
         if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
         pending_emotion_ = -1;
-        mouth_open_ = true;
+        mouth_open_ = false;
+		mouth_started_ = false;
         face_mode_ = FaceMode::kSpeaking;
         RequestFace();
 
@@ -489,9 +494,9 @@ void CustomLcdDisplay::SetStatus(const char* status) {
             args.dispatch_method = ESP_TIMER_TASK;
             args.name = "mouth_anim";
             esp_timer_create(&args, &mouth_timer_);
-        }
+               }
         esp_timer_stop(mouth_timer_);
-        esp_timer_start_periodic(mouth_timer_, 700 * 1000);
+        esp_timer_start_once(mouth_timer_, kMouthStartDelayMs * 1000);
     } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
         if (mouth_timer_) esp_timer_stop(mouth_timer_);
         if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
@@ -501,6 +506,7 @@ void CustomLcdDisplay::SetStatus(const char* status) {
     } else {
         if (mouth_timer_) esp_timer_stop(mouth_timer_);
     }
+	
 }
 
 void CustomLcdDisplay::ToggleMouth() {
@@ -563,9 +569,11 @@ void CustomLcdDisplay::SetEmotion(const char* emotion) {
 
 void CustomLcdDisplay::SetupUI() {
     ESP_LOGI(TAG, "Custom SetupUI: skipping default widgets");
-    Display::SetupUI();   // только помечаем, что UI готов
-    DrawFace(FACE_IDLE);  // сразу рисуем лицо
+    Display::SetupUI();
+    if (booting_) return;
+    DrawFace(FACE_IDLE);
 }
+
 void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
     ESP_LOGI(TAG, "ChatMessage [%s]: %s", role, content);
     // ничего не рисуем, лицо остаётся

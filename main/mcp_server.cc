@@ -28,8 +28,7 @@ McpServer::~McpServer() = default;
 void McpServer::AddCommonTools() {
     // *Important* To speed up the response time, we add the common tools to the beginning of
     // the tools list to utilize the prompt cache.
-    // **重要** 为了提升响应速度，我们把常用的工具放在前面，利用 prompt cache 的特性。
-
+	
     // Backup the original tools list and restore it after adding the common tools.
     auto original_tools = std::move(tools_);
     auto& board = Board::GetInstance();
@@ -71,50 +70,6 @@ void McpServer::AddCommonTools() {
                 });
     }
 
-#ifdef HAVE_LVGL
-    auto display = board.GetDisplay();
-    if (display && display->GetTheme() != nullptr) {
-        AddTool("self.screen.set_theme",
-                "Set the theme of the screen. The theme can be `light` or `dark`.",
-                PropertyList({Property("theme", kPropertyTypeString)}),
-                [display](const PropertyList& properties) -> ReturnValue {
-                    auto theme_name = properties["theme"].value<std::string>();
-                    auto& theme_manager = LvglThemeManager::GetInstance();
-                    auto theme = theme_manager.GetTheme(theme_name);
-                    if (theme != nullptr) {
-                        display->SetTheme(theme);
-                        return true;
-                    }
-                    return false;
-                });
-    }
-
-    auto camera = board.GetCamera();
-    if (camera) {
-        AddTool("self.camera.take_photo",
-                "Always remember you have a camera. If the user asks you to see something, use "
-                "this tool to take a photo and then explain it.\n"
-                "Args:\n"
-                "  `question`: The question that you want to ask about the photo.\n"
-                "Return:\n"
-                "  A JSON object that provides the photo information.",
-                PropertyList({Property("question", kPropertyTypeString)}),
-                [camera](const PropertyList& properties) -> ToolResult {
-                    // Lower the priority to do the camera capture
-                    TaskPriorityReset priority_reset(1);
-
-                    if (!camera->Capture()) {
-                        return std::unexpected("Failed to capture photo");
-                    }
-                    auto question = properties["question"].value<std::string>();
-                    auto result = camera->Explain(question);
-                    if (!result) {
-                        return std::unexpected(std::move(result.error()));
-                    }
-                    return std::move(*result);
-                });
-    }
-#endif
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), std::make_move_iterator(original_tools.begin()),
@@ -177,140 +132,7 @@ void McpServer::AddUserOnlyTools() {
                             return json;
                         });
 
-#if CONFIG_LV_USE_SNAPSHOT
-        AddUserOnlyTool(
-            "self.screen.snapshot", "Snapshot the screen and upload it to a specific URL",
-            PropertyList({Property("url", kPropertyTypeString),
-                          Property("quality", kPropertyTypeInteger, 80, 1, 100)}),
-            [display](const PropertyList& properties) -> ToolResult {
-                auto url = properties["url"].value<std::string>();
-                auto quality = properties["quality"].value<int>();
 
-                std::string jpeg_data;
-                if (!display->SnapshotToJpeg(jpeg_data, quality)) {
-                    return std::unexpected("Failed to snapshot screen");
-                }
-
-                ESP_LOGI(TAG, "Upload snapshot %u bytes to %s", jpeg_data.size(), url.c_str());
-
-                // 构造multipart/form-data请求体
-                std::string boundary = "----ESP32_SCREEN_SNAPSHOT_BOUNDARY";
-
-                auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
-                http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-                if (auto opened = http->Open("POST", url); !opened) {
-                    return std::unexpected("Failed to open URL: " + url + " (" +
-                                           opened.error().ToString() + ")");
-                }
-                auto write_or_fail = [&http](const char* data,
-                                             size_t size) -> std::optional<std::string> {
-                    if (auto written = http->Write(data, size); !written) {
-                        return written.error().ToString();
-                    }
-                    return std::nullopt;
-                };
-                {
-                    // 文件字段头部
-                    std::string file_header;
-                    file_header += "--" + boundary + "\r\n";
-                    file_header +=
-                        "Content-Disposition: form-data; name=\"file\"; "
-                        "filename=\"screenshot.jpg\"\r\n";
-                    file_header += "Content-Type: image/jpeg\r\n";
-                    file_header += "\r\n";
-                    if (auto error = write_or_fail(file_header.c_str(), file_header.size());
-                        error) {
-                        http->Close();
-                        return std::unexpected("Failed to upload screenshot: " + *error);
-                    }
-                }
-
-                // JPEG数据
-                if (auto error = write_or_fail((const char*)jpeg_data.data(), jpeg_data.size());
-                    error) {
-                    http->Close();
-                    return std::unexpected("Failed to upload screenshot: " + *error);
-                }
-
-                {
-                    // multipart尾部
-                    std::string multipart_footer;
-                    multipart_footer += "\r\n--" + boundary + "--\r\n";
-                    if (auto error =
-                            write_or_fail(multipart_footer.c_str(), multipart_footer.size());
-                        error) {
-                        http->Close();
-                        return std::unexpected("Failed to upload screenshot: " + *error);
-                    }
-                }
-                if (auto error = write_or_fail("", 0); error) {
-                    http->Close();
-                    return std::unexpected("Failed to upload screenshot: " + *error);
-                }
-
-                auto upload_status = http->GetStatusCode();
-                if (!upload_status) {
-                    return std::unexpected(upload_status.error().ToString());
-                }
-                if (*upload_status != 200) {
-                    return std::unexpected("Unexpected status code: " +
-                                           std::to_string(*upload_status));
-                }
-                std::string result = http->ReadAll();
-                http->Close();
-                ESP_LOGI(TAG, "Snapshot screen result: %s", result.c_str());
-                return true;
-            });
-
-        AddUserOnlyTool(
-            "self.screen.preview_image", "Preview an image on the screen",
-            PropertyList({Property("url", kPropertyTypeString)}),
-            [display](const PropertyList& properties) -> ToolResult {
-                auto url = properties["url"].value<std::string>();
-                auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
-
-                if (auto opened = http->Open("GET", url); !opened) {
-                    return std::unexpected("Failed to open URL: " + url + " (" +
-                                           opened.error().ToString() + ")");
-                }
-                auto status_code = http->GetStatusCode();
-                if (!status_code) {
-                    return std::unexpected(status_code.error().ToString());
-                }
-                if (*status_code != 200) {
-                    return std::unexpected("Unexpected status code: " +
-                                           std::to_string(*status_code));
-                }
-
-                size_t content_length = http->GetBodyLength();
-                using BufferPtr = std::unique_ptr<char, decltype(&heap_caps_free)>;
-                BufferPtr data(
-                    static_cast<char*>(heap_caps_malloc(content_length, MALLOC_CAP_8BIT)),
-                    heap_caps_free);
-                if (data == nullptr) {
-                    return std::unexpected("Failed to allocate memory for image: " + url);
-                }
-                size_t total_read = 0;
-                while (total_read < content_length) {
-                    auto ret = http->Read(data.get() + total_read, content_length - total_read);
-                    if (!ret) {
-                        return std::unexpected("Failed to download image: " + url);
-                    }
-                    if (*ret == 0) {
-                        break;
-                    }
-                    total_read += *ret;
-                }
-                http->Close();
-
-                auto image = std::make_unique<LvglAllocatedImage>(data.release(), total_read);
-                if (!image->IsValid()) {
-                    return std::unexpected("Downloaded image is invalid: " + url);
-                }
-                display->SetPreviewImage(std::move(image));
-                return true;
-            });
-#endif  // CONFIG_LV_USE_SNAPSHOT
     }
 #endif  // HAVE_LVGL
 
