@@ -13,9 +13,11 @@
 #include "assets/lang_config.h"
 #include "application.h"
 #define TAG "CustomLcdDisplay"
-
+LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 #define BYTES_PER_PIXEL (LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565))
 #define BUFF_SIZE (EXAMPLE_LCD_WIDTH * EXAMPLE_LCD_HEIGHT * BYTES_PER_PIXEL)
+
+
 
 const uint8_t WF_Full_1IN54[159] =
 {											
@@ -65,6 +67,25 @@ const uint8_t WF_PARTIAL_1IN54_0[159] =
 
 void CustomLcdDisplay::lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_p) {
     assert(disp != NULL);
+    CustomLcdDisplay *driver = (CustomLcdDisplay *) lv_display_get_user_data(disp);
+ 
+    // LVGL имеет право рисовать на панель только в режиме виджета.
+    // Во всех остальных режимах экраном владеет отрисовка лиц.
+    if (driver == nullptr || driver->face_mode_ != FaceMode::kWidget) {
+        lv_disp_flush_ready(disp);
+        return;
+    }
+ 
+    uint16_t *buffer = (uint16_t *) color_p;
+    driver->EPD_Clear();
+    for (int y = area->y1; y <= area->y2; y++) {
+        for (int x = area->x1; x <= area->x2; x++) {
+            uint8_t color = (*buffer < 0x7fff) ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE;
+            driver->EPD_DrawColorPixel(x, y, color);
+            buffer++;
+        }
+    }
+    driver->EPD_DisplayPart();
     lv_disp_flush_ready(disp);
 }
 
@@ -447,10 +468,12 @@ void CustomLcdDisplay::SetStatus(const char* status) {
     ESP_LOGI(TAG, "SetStatus: %s", status);
     if (face_mode_ == FaceMode::kShuttingDown) return;
     if (booting_) return;
-
+    if (face_mode_ == FaceMode::kWidget) return;   // виджет досматриваем до конца
+ 
     if (strcmp(status, Lang::Strings::LISTENING) == 0) {
         if (mouth_timer_) esp_timer_stop(mouth_timer_);
-
+        if (mouth_delay_timer_) esp_timer_stop(mouth_delay_timer_);
+ 
         // Эмоция, пришедшая во время речи, показывается теперь, когда
         // рот уже не двигается, и гаснет через полторы секунды.
         if (pending_emotion_ >= 0) {
@@ -458,7 +481,7 @@ void CustomLcdDisplay::SetStatus(const char* status) {
             pending_emotion_ = -1;
             face_mode_ = FaceMode::kEmotion;
             RequestFace();
-
+ 
             if (emotion_revert_timer_ == nullptr) {
                 esp_timer_create_args_t args = {};
                 args.callback = [](void* arg) {
@@ -477,14 +500,13 @@ void CustomLcdDisplay::SetStatus(const char* status) {
             face_mode_ = FaceMode::kListening;
             RequestFace();
         }
-        } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+    } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
         if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
         pending_emotion_ = -1;
         mouth_open_ = false;
-		mouth_started_ = false;
         face_mode_ = FaceMode::kSpeaking;
         RequestFace();
-
+ 
         if (mouth_timer_ == nullptr) {
             esp_timer_create_args_t args = {};
             args.callback = [](void* arg) {
@@ -494,28 +516,46 @@ void CustomLcdDisplay::SetStatus(const char* status) {
             args.dispatch_method = ESP_TIMER_TASK;
             args.name = "mouth_anim";
             esp_timer_create(&args, &mouth_timer_);
-               }
+        }
+        if (mouth_delay_timer_ == nullptr) {
+            esp_timer_create_args_t args = {};
+            args.callback = [](void* arg) {
+                static_cast<CustomLcdDisplay*>(arg)->StartMouthAnim();
+            };
+            args.arg = this;
+            args.dispatch_method = ESP_TIMER_TASK;
+            args.name = "mouth_delay";
+            esp_timer_create(&args, &mouth_delay_timer_);
+        }
         esp_timer_stop(mouth_timer_);
-        esp_timer_start_once(mouth_timer_, kMouthStartDelayMs * 1000);
+        esp_timer_stop(mouth_delay_timer_);
+        esp_timer_start_once(mouth_delay_timer_, kMouthStartDelayMs * 1000);
     } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
         if (mouth_timer_) esp_timer_stop(mouth_timer_);
+        if (mouth_delay_timer_) esp_timer_stop(mouth_delay_timer_);
         if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
         pending_emotion_ = -1;
         face_mode_ = FaceMode::kIdle;
         RequestFace();
     } else {
         if (mouth_timer_) esp_timer_stop(mouth_timer_);
+        if (mouth_delay_timer_) esp_timer_stop(mouth_delay_timer_);
     }
-	
 }
-
 void CustomLcdDisplay::ToggleMouth() {
     if (face_mode_ != FaceMode::kSpeaking) {
-        if (mouth_timer_) esp_timer_stop(mouth_timer_);
+                if (mouth_timer_) esp_timer_stop(mouth_timer_);
+        if (mouth_delay_timer_) esp_timer_stop(mouth_delay_timer_);
         return;
     }
     mouth_open_ = !mouth_open_;
     RequestFace();
+}
+
+void CustomLcdDisplay::StartMouthAnim() {
+    if (face_mode_ != FaceMode::kSpeaking) return;
+    esp_timer_start_periodic(mouth_timer_, kMouthPeriodMs * 1000);
+    ToggleMouth();   // первое движение сразу, дальше по таймеру
 }
 
 void CustomLcdDisplay::RequestFace() {
@@ -524,6 +564,8 @@ void CustomLcdDisplay::RequestFace() {
             return;
         case FaceMode::kBooting:
             return;
+		case FaceMode::kWidget:
+            return;   // экраном владеет LVGL, лицо не рисуем
         case FaceMode::kSpeaking:
             DrawFace(mouth_open_ ? FACE_SPEAKING : FACE_SPEAKING2);
             return;
@@ -542,6 +584,80 @@ void CustomLcdDisplay::RequestFace() {
 void CustomLcdDisplay::RevertToSpeakingFace() {
     if (face_mode_ == FaceMode::kEmotion) {
         face_mode_ = FaceMode::kListening;
+        RequestFace();
+    }
+}
+
+void CustomLcdDisplay::ShowTextWidget(const char* line1, const char* line2, int seconds) {
+    if (face_mode_ == FaceMode::kShuttingDown) return;
+    if (booting_) return;
+ 
+            if (mouth_timer_) esp_timer_stop(mouth_timer_);
+        if (mouth_delay_timer_) esp_timer_stop(mouth_delay_timer_);
+    if (emotion_revert_timer_) esp_timer_stop(emotion_revert_timer_);
+ 
+    // Режим ставим ДО обращения к LVGL, иначе его отрисовка будет
+    // отброшена проверкой в lvgl_flush_cb.
+    face_mode_ = FaceMode::kWidget;
+    current_face_ = -1;
+ 
+    lvgl_port_lock(0);
+    lv_obj_t* scr = lv_screen_active();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+ 
+    lv_obj_t* top = lv_label_create(scr);
+    lv_label_set_text(top, line1);
+    lv_obj_set_style_text_font(top, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_text_color(top, lv_color_black(), 0);
+    lv_obj_set_width(top, Width - 12);
+    lv_label_set_long_mode(top, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(top, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(top, LV_ALIGN_CENTER, 0, -30);
+ 
+    lv_obj_t* bottom = lv_label_create(scr);
+    lv_label_set_text(bottom, line2);
+    lv_obj_set_style_text_font(bottom, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_text_color(bottom, lv_color_black(), 0);
+    lv_obj_set_width(bottom, Width - 12);
+    lv_label_set_long_mode(bottom, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(bottom, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(bottom, LV_ALIGN_CENTER, 0, 20);
+ 
+    lv_obj_invalidate(scr);
+    lvgl_port_unlock();
+ 
+    if (widget_timer_ == nullptr) {
+        esp_timer_create_args_t args = {};
+        args.callback = [](void* arg) {
+            static_cast<CustomLcdDisplay*>(arg)->HideWidget();
+        };
+        args.arg = this;
+        args.dispatch_method = ESP_TIMER_TASK;
+        args.name = "widget_hide";
+        esp_timer_create(&args, &widget_timer_);
+    }
+    esp_timer_stop(widget_timer_);
+    esp_timer_start_once(widget_timer_, (int64_t)seconds * 1000000);
+}
+ 
+void CustomLcdDisplay::HideWidget() {
+    if (face_mode_ != FaceMode::kWidget) return;
+ 
+    // Сначала снимаем захват экрана, иначе очистка LVGL попадёт на панель.
+    face_mode_ = FaceMode::kIdle;
+ 
+    lvgl_port_lock(0);
+    lv_obj_clean(lv_screen_active());
+    lvgl_port_unlock();
+ 
+    auto state = Application::GetInstance().GetDeviceState();
+    if (state == kDeviceStateSpeaking) {
+        SetStatus(Lang::Strings::SPEAKING);
+    } else if (state == kDeviceStateListening) {
+        SetStatus(Lang::Strings::LISTENING);
+    } else {
         RequestFace();
     }
 }

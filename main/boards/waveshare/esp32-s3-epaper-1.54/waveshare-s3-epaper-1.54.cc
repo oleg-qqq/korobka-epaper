@@ -413,16 +413,37 @@ class CustomBoard : public WifiBoard {
         esp_timer_start_periodic(led_timer_, 400 * 1000);
     }
 	
-        void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
-
-		//wifi
+       
+       
+	   void InitializeTools() {
+		    auto &mcp_server = McpServer::GetInstance();
+			// показать погоду на экране
+        mcp_server.AddTool(
+            "self.screen.show_weather",
+            "Show the current weather on the device screen for ten seconds. "
+            "Call this when the user asks to SHOW the weather on the screen, "
+            "покажи погоду, выведи погоду на экран. "
+            "You can call it together with telling the weather out loud. "
+            "The device keeps talking while the screen shows the weather.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                WeatherCache w;
+                if (!GetWeather(w)) {
+                    return std::string("{\"success\":false}");
+                }
+                char line1[32];
+                snprintf(line1, sizeof(line1), "%.0f C", w.temperature);
+                std::string desc = WeatherCodeToText(w.weather_code);
+                display_->ShowTextWidget(line1, desc.c_str(), 10);
+                return std::string("{\"success\":true}");
+            });
+//wifi
         mcp_server.AddTool("self.disp.network", "Reconfigure WiFi connection", PropertyList(), [this](const PropertyList &) -> ReturnValue {
             EnterWifiConfigMode();
             return true;
         });
 
-        // монетка
+// монетка
         mcp_server.AddTool(
             "self.game.coin_flip",
             "Flip a coin (heads or tails, орёл или решка). "
@@ -437,7 +458,7 @@ class CustomBoard : public WifiBoard {
                 return std::string(heads ? "heads" : "tails");
             });
 			
-		// погода
+// погода
 		mcp_server.AddTool(
     "self.weather.get_current",
     "Get current weather in Limassol, Cyprus (Лимассол, Кипр). "
@@ -454,7 +475,7 @@ class CustomBoard : public WifiBoard {
         return w.summary;
     });
 			
-		//температура и влажность на датчике
+//температура и влажность на датчике
         mcp_server.AddTool("self.sensor.get_room_climate",
             "Get current room temperature in Celsius and humidity in percent from the built-in sensor",
             PropertyList(), [this](const PropertyList &) -> ReturnValue {
@@ -467,7 +488,22 @@ class CustomBoard : public WifiBoard {
                     "{\"success\":true,\"temperature\":%.1f,\"humidity\":%.1f}", t, h);
                 return std::string(buf);
             });
-			
+			       
+// уровень заряда
+        mcp_server.AddTool(
+            "self.battery.get_level",
+            "Get the current battery charge level in percent. "
+            "Call this when the user asks about the battery, the charge, "
+            "how much power is left, заряд, батарея, сколько осталось заряда, "
+            "на сколько хватит. "
+            "Returns a number from 0 to 100. "
+            "Tell the user the number in their language, briefly.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                int level = (int)BatterygetPercent();
+                ESP_LOGI(TAG, "Battery: %d%%", level);
+                return std::string("{\"percent\":") + std::to_string(level) + "}";
+            });
 			//бросить кубик
 			mcp_server.AddTool(
     "self.game.dice",
@@ -491,7 +527,7 @@ class CustomBoard : public WifiBoard {
         return std::string("{\"rolls\":[") + rolls + "],\"total\":" + std::to_string(total) + "}";
     });
 	
-	//таймер
+//таймер
 	        mcp_server.AddTool("self.timer.set",
             "Set a countdown timer. Call when the user asks to set a timer or remind after some time. "
             "seconds is the total time in seconds (convert minutes and hours to seconds). "
@@ -549,7 +585,7 @@ class CustomBoard : public WifiBoard {
                 return std::string("{\"elapsed_seconds\":") + std::to_string(elapsed) + "}";
             });
 			
-			// выключение по голосу
+// выключение по голосу
 mcp_server.AddTool(
     "self.power.shutdown",
     "Turn off the device completely (shut down, power off). "
@@ -573,7 +609,7 @@ mcp_server.AddTool(
         return std::string("{\"success\":true}");
     });
  
-	// остановить прослушивание по голосу
+// остановить прослушивание по голосу
 mcp_server.AddTool(
     "self.chat.stop_listening",
     "Stop listening / pause the conversation. "
@@ -643,7 +679,7 @@ mcp_server.AddTool(
                if (app.GetDeviceState() == kDeviceStateIdle) {
             ESP_LOGI(TAG, "Auto listen: device ready, saying hello");
             esp_timer_stop(autolisten_timer_);
-            app.WakeWordInvoke("Ты очнулся ото сна и готов"); //Говорит после пробуждения
+            app.WakeWordInvoke("Привет!!!"); //Говорит после пробуждения
             return;
         }
  
@@ -657,7 +693,7 @@ mcp_server.AddTool(
     }
  //экран загрузки, неблокирующий: кадры идут по таймеру,
  //параллельно с подключением к сети
- static constexpr int kBootFrameMs = 2000;   // 6 кадров, всего 12 секунд - ВРЕМЯ ЭКРАНА ЗАГРУЗКИ
+ static constexpr int kBootFrameMs = 1800;   // 6 кадров, всего 12 секунд - ВРЕМЯ ЭКРАНА ЗАГРУЗКИ
 
  void ShowBootProgress() {
     display_->SetBooting(true);

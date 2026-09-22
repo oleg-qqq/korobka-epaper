@@ -14,6 +14,7 @@ typedef enum {
 enum class FaceMode {
     kShuttingDown,
     kBooting,
+	kWidget, 
     kSpeaking,
     kListening,
     kEmotion,
@@ -42,7 +43,8 @@ public:
     void EPD_Init();    /* e-paper init */
 	void EPD_Clear();   /* clear screen */
 	void EPD_Display(); /* flush buffer to e-paper */
-
+	void ShowTextWidget(const char* line1, const char* line2, int seconds);
+	
 	/* fast refresh */
 	void EPD_DisplayPartBaseImage();
     void EPD_Init_Partial();
@@ -87,15 +89,17 @@ private:
     void spi_gpio_init();
     void spi_port_init();
     void read_busy();
-FaceMode face_mode_ = FaceMode::kIdle;
+    FaceMode face_mode_ = FaceMode::kIdle;
     bool booting_ = false;
      bool mouth_open_ = true;
-    esp_timer_handle_t mouth_timer_ = nullptr;
+     esp_timer_handle_t mouth_timer_ = nullptr;
      esp_timer_handle_t emotion_revert_timer_ = nullptr;
+	 esp_timer_handle_t widget_timer_ = nullptr;
      int emotion_face_ = FACE_HAPPY;   // какую именно эмоцию сейчас показываем
 	 int pending_emotion_ = -1;   // эмоция, отложенная до конца речи
-	 bool mouth_started_ = false;
-	 
+	     esp_timer_handle_t mouth_delay_timer_ = nullptr;
+    void StartMouthAnim();
+    void HideWidget();
     void set_cs_1(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,1);}
     void set_cs_0(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,0);}
     void set_dc_1(){gpio_set_level((gpio_num_t)lcd_spi_data.dc,1);}
