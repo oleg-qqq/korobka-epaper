@@ -93,6 +93,13 @@ static constexpr int kNightFromHour = 1;
 static constexpr int kNightToHour = 6;
 static constexpr int kNightWakeSec = 600;
 
+// ===== ФРАЗА ПОСЛЕ ВЫХОДА ИЗ РЕЖИМА ЧАСОВ =====
+// Уходит ассистенту как твоя реплика. Он ответит своими словами,
+// коротко: режим часов выключен, он снова на связи.
+static constexpr const char* kDeskExitPhrase =
+    "Я только что вывел тебя из режима часов кнопкой. Не здоровайся заново, как при включении. "
+    "Скажи одной короткой фразой, что режим часов выключен и ты снова слушаешь.";
+
 // ===== АВТОСОН =====
 // Если столько минут подряд никто не разговаривает, устройство само
 // уходит в режим часов (как по кнопке PWR). 0 = никогда не засыпать.
@@ -875,8 +882,6 @@ class CustomBoard : public WifiBoard {
 	esp_timer_handle_t led_timer_ = nullptr;
     bool led_blink_on_ = false;
 	int idle_blink_tick_ = 0;
-	esp_timer_handle_t boot_timer_ = nullptr;
-    int boot_frame_ = 0;
 	int wifi_check_tick_ = 0;
     int wifi_warn_cooldown_ = 0;
     bool desk_entering_ = false;       // уже переходим в режим часов
@@ -1403,14 +1408,26 @@ mcp_server.AddTool(
  
         // kDeviceStateIdle означает: загрузка закончена, Wi-Fi поднят,
         // протокол готов, устройство просто ждёт команды.
-               if (app.GetDeviceState() == kDeviceStateIdle) {
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            // Сначала доигрываем анимацию включения (быстро, сразу последний
+            // кадр), и только потом здороваемся, чтобы речь было слышно с начала.
+            boot_hurry_ = true;
+            if (!boot_done_) {
+                autolisten_retries_--;   // ожидание анимации не считаем
+                return;
+            }
             ESP_LOGI(TAG, "Auto listen: device ready, saying hello");
             esp_timer_stop(autolisten_timer_);
             StartSntpOnce();
             // Проснулись из-за будильника или напоминания: вместо "привет"
             // будет звонок и свой рассказ.
             if (skip_greeting_ || ring_kind_ >= 0 || alert_active_ || !pending_speech_.empty()) return;
-            app.WakeWordInvoke("Привет!!!"); //Говорит после пробуждения
+            if (woke_from_desk_) {
+                // Вышли из режима часов кнопкой: не здороваемся как при включении.
+                app.WakeWordInvoke(kDeskExitPhrase);
+            } else {
+                app.WakeWordInvoke("Привет!!!"); //Говорит после включения
+            }
             return;
         }
  
@@ -1425,7 +1442,6 @@ mcp_server.AddTool(
  //экран загрузки, неблокирующий: кадры идут по таймеру,
  //параллельно с подключением к сети
  static constexpr int kBootFrameMs = 1800;   // обычное включение: 6 кадров по 1.8 с - ВРЕМЯ ЭКРАНА ЗАГРУЗКИ
- static constexpr int kBootTickMs = 300;     // шаг таймера анимации загрузки
 
  // Кадр анимации загрузки: целое лицо (full >= 0) или глаза + рот.
  struct BootStep {
@@ -1464,8 +1480,10 @@ mcp_server.AddTool(
 
  const BootStep* boot_steps_ = kColdBoot;
  int boot_step_count_ = 0;
- int boot_step_left_ms_ = 0;
  bool woke_from_desk_ = false;   // этот запуск: выход из режима часов
+ volatile bool boot_hurry_ = false;   // устройство уже готово: сразу к последнему кадру
+ volatile bool boot_abort_ = false;   // уходим в режим часов: анимацию бросить
+ volatile bool boot_done_ = false;    // анимация закончилась, лицо рисует аниматор
 
  void DrawBootStep(const BootStep& st) {
      if (st.full >= 0) {
@@ -1475,6 +1493,10 @@ mcp_server.AddTool(
      }
  }
 
+ // Анимация включения идёт в своей задаче с низким приоритетом,
+ // параллельно с подключением к сети. Раньше она работала в системном
+ // таймере с высоким приоритетом и перекрывала приветствие: первые
+ // секунды речи было не слышно, пока анимация не закончится.
  void ShowBootProgress() {
     display_->SetBooting(true);
     if (boot_event_.kind != ORG_EV_NONE) {
@@ -1487,50 +1509,50 @@ mcp_server.AddTool(
         boot_steps_ = kColdBoot;
         boot_step_count_ = sizeof(kColdBoot) / sizeof(kColdBoot[0]);
     }
-    boot_frame_ = 0;
-    boot_step_left_ms_ = boot_steps_[0].ms;
-    DrawBootStep(boot_steps_[0]);
+    boot_done_ = false;
+    DrawBootStep(boot_steps_[0]);   // первый кадр сразу
 
-    esp_timer_create_args_t args = {};
-    args.callback = [](void* arg) {
-        static_cast<CustomBoard*>(arg)->NextBootFrame();
-    };
-    args.arg = this;
-    args.dispatch_method = ESP_TIMER_TASK;
-    args.name = "boot_anim";
-    args.skip_unhandled_events = true;
-
-    if (esp_timer_create(&args, &boot_timer_) != ESP_OK) {
-        ESP_LOGE(TAG, "Boot anim: failed to create timer");
-        display_->SetBooting(false);
-        return;
+    BaseType_t ok = xTaskCreate([](void* arg) {
+        static_cast<CustomBoard*>(arg)->BootAnimTask();
+        vTaskDelete(nullptr);
+    }, "boot_anim", 4096, this, 1, nullptr);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Boot anim: failed to create task");
+        FinishBoot();
     }
-    esp_timer_start_periodic(boot_timer_, kBootTickMs * 1000);
-}
+ }
 
- void NextBootFrame() {
-    boot_step_left_ms_ -= kBootTickMs;
-    if (boot_step_left_ms_ > 0) return;   // текущий кадр ещё показываем
-
-    boot_frame_++;
-    if (boot_frame_ >= boot_step_count_) {
-        esp_timer_stop(boot_timer_);
-        display_->SetBooting(false);
-        // Если за время загрузки он уже успел заговорить или слушает,
-        // сразу рисуем правильное лицо, а не обычное.
-        auto state = Application::GetInstance().GetDeviceState();
-        if (state == kDeviceStateListening) {
-            display_->SetStatus(Lang::Strings::LISTENING);
-        } else if (state == kDeviceStateSpeaking) {
-            display_->SetStatus(Lang::Strings::SPEAKING);
-        } else {
-            display_->RequestFace();
+ void BootAnimTask() {
+    for (int i = 0; i < boot_step_count_ && !boot_abort_; i++) {
+        if (i > 0) DrawBootStep(boot_steps_[i]);
+        int left = boot_steps_[i].ms;
+        while (left > 0 && !boot_abort_) {
+            if (boot_hurry_ && i < boot_step_count_ - 1) break;   // готовы: прыжок к последнему кадру
+            if (boot_hurry_ && left > 600) left = 600;            // последний кадр недолго
+            vTaskDelay(pdMS_TO_TICKS(100));
+            left -= 100;
         }
-        return;
+        if (boot_hurry_ && i < boot_step_count_ - 1) {
+            i = boot_step_count_ - 2;   // следующий шаг цикла: последний кадр
+        }
     }
-    boot_step_left_ms_ = boot_steps_[boot_frame_].ms;
-    DrawBootStep(boot_steps_[boot_frame_]);
-}
+    if (!boot_abort_) FinishBoot();
+ }
+
+ void FinishBoot() {
+    display_->SetBooting(false);
+    // Если за время загрузки он уже успел заговорить или слушает,
+    // сразу рисуем правильное лицо, а не обычное.
+    auto state = Application::GetInstance().GetDeviceState();
+    if (state == kDeviceStateListening) {
+        display_->SetStatus(Lang::Strings::LISTENING);
+    } else if (state == kDeviceStateSpeaking) {
+        display_->SetStatus(Lang::Strings::SPEAKING);
+    } else {
+        display_->RequestFace();
+    }
+    boot_done_ = true;
+ }
  
     // Запускает периодическую проверку готовности устройства.
     void StartAutoListen() {
@@ -2305,7 +2327,7 @@ mcp_server.AddTool(
 
         // Останавливаем всё, что может рисовать лица.
         if (led_timer_) esp_timer_stop(led_timer_);
-        if (boot_timer_) esp_timer_stop(boot_timer_);
+        boot_abort_ = true;
         if (autolisten_timer_) esp_timer_stop(autolisten_timer_);
         display_->SetShuttingDown(true);
         // Засыпает, два кадра: глаза слипаются, потом спит с "Z".
@@ -2565,11 +2587,10 @@ mcp_server.AddTool(
             time_t at = (time_t)e.at;
             struct tm tm_a;
             localtime_r(&at, &tm_a);
-            char buf[256];
-            snprintf(buf, sizeof(buf),
-                     "Сработало напоминание, которое я просил поставить на %d:%02d. "
-                     "Коротко напомни мне о нём вслух: %s", tm_a.tm_hour, tm_a.tm_min, text);
-            QueueSpeech(buf);
+            char hm[8];
+            snprintf(hm, sizeof(hm), "%d:%02d", tm_a.tm_hour % 24, tm_a.tm_min % 60);
+            QueueSpeech(std::string("Сработало напоминание, которое я просил поставить на ") + hm +
+                        ". Коротко напомни мне о нём вслух: " + text);
             return;
         }
         if (e.kind == ORG_EV_TIMER) {
@@ -2592,14 +2613,14 @@ mcp_server.AddTool(
         time_t now = time(nullptr);
         struct tm tm_n;
         localtime_r(&now, &tm_n);
-        char buf[512];
-        snprintf(buf, sizeof(buf),
-                 "Доброе утро! Я только что выключил будильник. Сегодня %s, %d %s. "
-                 "Расскажи бодро и коротко, примерно за полминуты: какая сегодня погода в Лимассоле "
-                 "(узнай через инструмент погоды), один интересный факт или событие, связанное с этой "
-                 "датой в истории или календаре, и что-нибудь забавное для хорошего настроения.",
-                 kWd[tm_n.tm_wday], tm_n.tm_mday, kMon[tm_n.tm_mon]);
-        QueueSpeech(buf);
+        // Русские буквы занимают по 2 байта, поэтому строку собираем без буфера фиксированного размера.
+        std::string text = "Доброе утро! Я только что выключил будильник. Сегодня ";
+        text += kWd[tm_n.tm_wday];
+        text += ", " + std::to_string(tm_n.tm_mday) + " " + kMon[tm_n.tm_mon] + ". ";
+        text += "Расскажи бодро и коротко, примерно за полминуты: какая сегодня погода в Лимассоле "
+                "(узнай через инструмент погоды), один интересный факт или событие, связанное с этой "
+                "датой в истории или календаре, и что-нибудь забавное для хорошего настроения.";
+        QueueSpeech(text);
     }
 
     // Кнопка во время звонка или оповещения. true: нажатие обработано.
