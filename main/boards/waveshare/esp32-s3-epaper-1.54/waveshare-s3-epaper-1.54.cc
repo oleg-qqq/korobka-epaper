@@ -22,7 +22,274 @@
 #include <string>
 #include "assets/lang_config.h"
 #include <esp_wifi.h>
+#include "widget_art.h"
+#include <esp_sleep.h>
+#include <esp_system.h>
+#include <esp_attr.h>
+#include <esp_netif.h>
+#include <esp_netif_sntp.h>
+#include <esp_event.h>
+#include <driver/rtc_io.h>
+#include <freertos/event_groups.h>
+#include <sys/time.h>
+#include <cstring>
+#include "ssid_manager.h"
+#include <nvs.h>
+#include <math.h>
+#include <memory>
 #define TAG "waveshare_epaper_1_54"
+
+// ===== ЧАСОВОЙ ПОЯС =====
+// Кипр: зимой UTC+2, летом UTC+3, переход автоматически.
+static constexpr const char* kTimeZone = "EET-2EEST,M3.5.0/3,M10.5.0/4";
+
+// ===== МИКРОФОН =====
+// Усиление микрофона в дБ. У кодека ступени по 6 дБ: 0, 6, 12 ... 42.
+// По умолчанию в xiaozhi 30. Каждые +6 дБ это примерно вдвое громче.
+// Если он начнёт слышать сам себя или шипеть, верни на 30.
+static constexpr float kMicGainDb = 36.0f;
+
+static bool IsTimeValidNow() {
+    return time(nullptr) > 1600000000;   // время уже пришло из сети
+}
+
+// Точное время из интернета (SNTP) уже пришло хотя бы раз.
+// Только ему можно верить: сервер xiaozhi при проверке обновлений ставит
+// часы сразу по местному времени, и вместе с часовым поясом выходит +3 часа.
+static volatile bool s_sntp_synced = false;
+
+static void OnSntpSync(struct timeval* tv) {
+    s_sntp_synced = true;
+    ESP_LOGI("waveshare_epaper_1_54", "SNTP: time synced");
+}
+
+// ===== РЕЖИМ ЧАСОВ (deep sleep) =====
+// Настройки. Меняй смело, остальной код подстроится.
+static constexpr int kDeskWakeSec = 60;                    // как часто просыпаться и обновлять экран
+static constexpr int64_t kDeskSyncSec = 24LL * 60 * 60;    // как часто ходить в сеть за временем и погодой
+static constexpr int kDeskFullRefreshEvery = 60;           // раз в столько обновлений полная перерисовка (чистит следы)
+static constexpr int kDeskLongPressMs = 1200;              // удержание PWR во сне = выключение
+static constexpr int kDeskWifiTimeoutMs = 12000;           // сколько ждать Wi-Fi на одну сеть
+static constexpr uint32_t kDeskMagic = 0x4B4F5242;         // метка "данные режима часов настоящие"
+static constexpr int kDeskFrameBytes = 5000;               // размер кадра экрана 200x200 по 1 биту
+static constexpr bool kDeskPageBarAlways = false;          // true: полоска страниц видна всегда, а не только при листании
+
+// Погода в простом виде, который переживает глубокий сон.
+struct DeskRtcWeather {
+    bool valid;
+    float temperature;
+    int16_t code;
+    int16_t humidity;
+    bool has_days;
+    int8_t day[3];
+    int16_t day_code[3];
+    float day_tmax[3];
+    int64_t fetched_unix;
+};
+
+// Всё, что режим часов помнит между пробуждениями. Лежит в RTC-памяти,
+// она не стирается во сне. При обычном включении обнуляется.
+struct DeskRtcState {
+    uint32_t magic;
+    bool active;                  // сейчас режим часов
+    uint8_t page;                 // какая страница на экране
+    uint16_t updates_since_full;  // сколько быстрых обновлений с последнего полного
+    int64_t last_sync;            // когда последний раз ходили в сеть
+    DeskRtcWeather weather;
+    bool frame_valid;
+    uint8_t frame[kDeskFrameBytes];   // что сейчас нарисовано на экране
+};
+
+static RTC_DATA_ATTR DeskRtcState s_desk;
+
+// ===== ИСТОРИЯ ДЛЯ ГРАФИКОВ =====
+// Комната раз в 10 минут за сутки, батарея раз в час за неделю.
+// Пишется и в обычном режиме, и в режиме часов. Живёт в RTC-памяти
+// (переживает сон), а раз в час сохраняется во флеш (переживает выключение).
+static constexpr uint32_t kHistMagic = 0x48495354;   // "HIST"
+static constexpr uint32_t kFcMagic = 0x46434153;     // "FCAS"
+static constexpr int16_t kHistNoTemp = -32768;
+static constexpr uint8_t kHistNoValue = 255;
+
+struct HistRtc {
+    uint32_t magic;
+    int64_t room_last_slot;                  // номер 10-минутки последней записи
+    int16_t room_t10[DESK_ROOM_POINTS];      // температура x10
+    uint8_t room_h[DESK_ROOM_POINTS];        // влажность, %
+    int64_t batt_last_slot;                  // номер часа последней записи
+    uint8_t batt[DESK_BATT_POINTS];          // заряд, %
+};
+
+static RTC_DATA_ATTR HistRtc s_hist;
+static RTC_DATA_ATTR ForecastExtra s_fc;
+
+static void HistClear() {
+    memset(&s_hist, 0, sizeof(s_hist));
+    s_hist.magic = kHistMagic;
+    for (int i = 0; i < DESK_ROOM_POINTS; i++) {
+        s_hist.room_t10[i] = kHistNoTemp;
+        s_hist.room_h[i] = kHistNoValue;
+    }
+    for (int i = 0; i < DESK_BATT_POINTS; i++) {
+        s_hist.batt[i] = kHistNoValue;
+    }
+}
+
+static void HistSaveToFlash() {
+    nvs_handle_t h;
+    if (nvs_open("desk", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "hist", &s_hist, sizeof(s_hist));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// После обычного включения RTC-память пустая: достаём историю из флеша.
+static void HistEnsureLoaded() {
+    if (s_hist.magic == kHistMagic) return;
+    HistClear();
+    nvs_handle_t h;
+    if (nvs_open("desk", NVS_READONLY, &h) != ESP_OK) return;
+    HistRtc tmp;
+    size_t len = sizeof(tmp);
+    if (nvs_get_blob(h, "hist", &tmp, &len) == ESP_OK && len == sizeof(tmp) &&
+        tmp.magic == kHistMagic) {
+        s_hist = tmp;
+        ESP_LOGI("waveshare_epaper_1_54", "History loaded from flash");
+    }
+    nvs_close(h);
+}
+
+// Кладёт значение в кольцевой буфер по номеру слота. Пропущенные слоты
+// помечаются "нет данных". Если время прыгнуло назад, история начинается заново.
+template <typename T>
+static void HistPut(T* ring, int size, int64_t& last_slot, int64_t slot, T value, T none) {
+    if (last_slot == 0 || slot < last_slot || slot - last_slot >= size) {
+        for (int i = 0; i < size; i++) ring[i] = none;
+    } else {
+        for (int64_t k = last_slot + 1; k < slot; k++) ring[k % size] = none;
+    }
+    ring[slot % size] = value;
+    last_slot = slot;
+}
+
+// Записывает текущие показания, если начался новый слот.
+static void HistRecord(bool room_ok, float t, float h, int battery) {
+    if (time(nullptr) < 1600000000) return;   // без настоящего времени не пишем
+    HistEnsureLoaded();
+    int64_t now = (int64_t)time(nullptr);
+
+    int64_t slot = now / 600;
+    if (slot != s_hist.room_last_slot) {
+        int16_t tv = room_ok ? (int16_t)lroundf(t * 10.0f) : kHistNoTemp;
+        int hv = (int)lroundf(h);
+        uint8_t hb = room_ok ? (uint8_t)(hv < 0 ? 0 : (hv > 100 ? 100 : hv)) : kHistNoValue;
+        int64_t last_t = s_hist.room_last_slot;
+        HistPut<int16_t>(s_hist.room_t10, DESK_ROOM_POINTS, last_t, slot, tv, kHistNoTemp);
+        int64_t last_h = s_hist.room_last_slot;
+        HistPut<uint8_t>(s_hist.room_h, DESK_ROOM_POINTS, last_h, slot, hb, kHistNoValue);
+        s_hist.room_last_slot = slot;
+    }
+
+    int64_t hour = now / 3600;
+    if (hour != s_hist.batt_last_slot) {
+        uint8_t bv = (battery >= 0 && battery <= 100) ? (uint8_t)battery : kHistNoValue;
+        HistPut<uint8_t>(s_hist.batt, DESK_BATT_POINTS, s_hist.batt_last_slot, hour, bv, kHistNoValue);
+        HistSaveToFlash();   // раз в час во флеш
+    }
+}
+
+// Примерно сколько дней проживёт батарея: скорость разряда с последней зарядки.
+static int EstimateBatteryDays() {
+    if (s_hist.magic != kHistMagic || s_hist.batt_last_slot == 0) return -1;
+    int64_t last = s_hist.batt_last_slot;
+    uint8_t v_now = s_hist.batt[last % DESK_BATT_POINTS];
+    if (v_now == kHistNoValue) return -1;
+    int v_start = v_now;
+    int hours = 0;
+    for (int k = 1; k < DESK_BATT_POINTS; k++) {
+        uint8_t v = s_hist.batt[(last - k) % DESK_BATT_POINTS];
+        if (v == kHistNoValue) break;
+        if (v + 2 < v_start) break;   // раньше заряд был ниже: тут заряжали
+        if (v > v_start) v_start = v;
+        hours = k;
+    }
+    int drop = v_start - v_now;
+    if (hours < 6 || drop < 3) return -1;   // мало данных для оценки
+    float per_hour = (float)drop / (float)hours;
+    int days = (int)lroundf((float)v_now / per_hour / 24.0f);
+    return days > 99 ? 99 : days;
+}
+
+// Раскладывает историю и прогноз в массивы для графиков.
+static void FillChartData(DeskScreenData& d) {
+    d.now = (int64_t)time(nullptr);
+    if (d.now < 1600000000) return;
+
+    if (s_hist.magic == kHistMagic) {
+        int64_t slot_now = d.now / 600;
+        d.room_t0 = (slot_now - (DESK_ROOM_POINTS - 1)) * 600;
+        for (int i = 0; i < DESK_ROOM_POINTS; i++) {
+            int64_t slot = slot_now - (DESK_ROOM_POINTS - 1) + i;
+            if (slot > s_hist.room_last_slot || slot <= s_hist.room_last_slot - DESK_ROOM_POINTS) continue;
+            int16_t tv = s_hist.room_t10[slot % DESK_ROOM_POINTS];
+            uint8_t hv = s_hist.room_h[slot % DESK_ROOM_POINTS];
+            if (tv != kHistNoTemp) d.room_t_hist[i] = tv / 10.0f;
+            if (hv != kHistNoValue) d.room_h_hist[i] = (float)hv;
+        }
+        int64_t hour_now = d.now / 3600;
+        d.batt_t0 = (hour_now - (DESK_BATT_POINTS - 1)) * 3600;
+        for (int i = 0; i < DESK_BATT_POINTS; i++) {
+            int64_t slot = hour_now - (DESK_BATT_POINTS - 1) + i;
+            if (slot > s_hist.batt_last_slot || slot <= s_hist.batt_last_slot - DESK_BATT_POINTS) continue;
+            uint8_t bv = s_hist.batt[slot % DESK_BATT_POINTS];
+            if (bv != kHistNoValue) d.batt_hist[i] = (float)bv;
+        }
+        d.batt_days_left = EstimateBatteryDays();
+    }
+
+    d.hour0 = d.now - d.now % 3600;
+    if (s_fc.magic == kFcMagic) {
+        for (int i = 0; i < 25; i++) {
+            int64_t tp = d.hour0 - (int64_t)(24 - i) * 3600;
+            int64_t ip = (tp - s_fc.hourly_start) / 3600;
+            if (ip >= 0 && ip < FC_HOURS && s_fc.hourly_t10[ip] != FC_NO_TEMP) {
+                d.out_past[i] = s_fc.hourly_t10[ip] / 10.0f;
+            }
+            int64_t tn = d.hour0 + (int64_t)i * 3600;
+            int64_t in = (tn - s_fc.hourly_start) / 3600;
+            if (in >= 0 && in < FC_HOURS && s_fc.hourly_t10[in] != FC_NO_TEMP) {
+                d.out_next[i] = s_fc.hourly_t10[in] / 10.0f;
+            }
+            if (i < 24 && in >= 0 && in < FC_HOURS && s_fc.hourly_rain[in] != FC_NO_VALUE) {
+                d.rain_next[i] = (float)s_fc.hourly_rain[in];
+            }
+        }
+        for (int i = 0; i < FC_DAYS; i++) {
+            if (s_fc.day_start[i] <= d.now && d.now < s_fc.day_start[i] + 86400 &&
+                s_fc.sunrise[i] > 0 && s_fc.sunset[i] > s_fc.sunrise[i]) {
+                d.sun_ok = true;
+                d.sunrise = s_fc.sunrise[i];
+                d.sunset = s_fc.sunset[i];
+                d.uv_max = (s_fc.uv10[i] != FC_NO_VALUE) ? s_fc.uv10[i] / 10.0f : -1.0f;
+                break;
+            }
+        }
+    }
+}
+
+// Для ожидания подключения к Wi-Fi во сне.
+static EventGroupHandle_t s_desk_wifi_events = nullptr;
+static constexpr EventBits_t kDeskWifiGotIp = BIT0;
+static constexpr EventBits_t kDeskWifiLost = BIT1;
+
+static void DeskWifiEvent(void* arg, esp_event_base_t base, int32_t id, void* data) {
+    if (s_desk_wifi_events == nullptr) return;
+    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_desk_wifi_events, kDeskWifiGotIp);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupSetBits(s_desk_wifi_events, kDeskWifiLost);
+    }
+}
 
 // ===== ПОГОДА (Open-Meteo, Лимассол, Кипр) =====
 // Вставить после блока с монеткой (self.game.coin_flip)
@@ -30,16 +297,7 @@
 // Координаты Лимассола, Кипр
 static constexpr double kWeatherLat = 34.7071;
 static constexpr double kWeatherLon = 33.0226;
- 
-// Простейший кэш, чтобы не долбить API при каждом вопросе / каждом
-// обновлении заставки. Живёт 10 минут.
-struct WeatherCache {
-    std::string summary;      // готовая фраза для голоса
-    float temperature = 0.0f; // для заставки на экране
-    int weather_code = 0;     // код погоды Open-Meteo (для иконки)
-    int64_t fetched_at_ms = 0;
-    bool valid = false;
-};
+
 static WeatherCache s_weather_cache;
 static constexpr int64_t kWeatherCacheTtlMs = 10 * 60 * 1000; // 10 минут
  
@@ -57,18 +315,32 @@ static std::string WeatherCodeToText(int code) {
     if (code >= 95 && code <= 99) return "гроза";
     return "неизвестно";
 }
+
+// Готовая фраза для голоса.
+static std::string MakeWeatherSummary(float temperature, int weather_code) {
+    char summary[128];
+    snprintf(summary, sizeof(summary),
+             "В Лимассоле сейчас %s, температура %.0f градусов",
+             WeatherCodeToText(weather_code).c_str(), temperature);
+    return summary;
+}
  
 // Делает запрос к Open-Meteo и обновляет кэш.
-// Возвращает true при успехе.
-static bool FetchWeather() {
-    char url[256];
+// Возвращает true при успехе. network: чем ходить в интернет
+// (в обычном режиме и в режиме часов это разные пути).
+template <typename Net>
+static bool FetchWeather(Net* network) {
+    // Время в ответе в виде unix-секунд, так проще и нет путаницы с поясами.
+    // past_days=1 даёт ещё и вчерашний день: нужен графику "дом и улица за сутки".
+    char url[512];
     snprintf(url, sizeof(url),
              "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-             "&current=temperature_2m,weather_code&timezone=auto",
+             "&current=temperature_2m,weather_code,relative_humidity_2m"
+             "&hourly=temperature_2m,precipitation_probability"
+             "&daily=weather_code,temperature_2m_max,sunrise,sunset,uv_index_max"
+             "&past_days=1&forecast_days=4&timezone=auto&timeformat=unixtime",
              kWeatherLat, kWeatherLon);
  
-    auto& board = Board::GetInstance();
-    auto network = board.GetNetwork();
     auto http = network->CreateHttp(0);
     if (http == nullptr) {
         ESP_LOGE("Weather", "Failed to create http client");
@@ -123,19 +395,126 @@ static bool FetchWeather() {
  
     float temperature = (float)temp->valuedouble;
     int weather_code = code->valueint;
-    std::string desc = WeatherCodeToText(weather_code);
- 
-    char summary[128];
-    snprintf(summary, sizeof(summary),
-             "В Лимассоле сейчас %s, температура %.0f градусов",
-             desc.c_str(), temperature);
- 
-    s_weather_cache.summary = summary;
+
+    // влажность
+    cJSON *hum = cJSON_GetObjectItem(current, "relative_humidity_2m");
+    int humidity = (hum != nullptr) ? hum->valueint : 0;
+
+    // Точка отсчёта "сейчас": часы устройства, а если они ещё не
+    // выставлены, время из ответа сервера.
+    int64_t ref_now = (int64_t)time(nullptr);
+    cJSON *ctime_item = cJSON_GetObjectItem(current, "time");
+    if (!IsTimeValidNow() && ctime_item != nullptr && cJSON_IsNumber(ctime_item)) {
+        ref_now = (int64_t)ctime_item->valuedouble;
+    }
+
+    // Дни: [0] вчера, [1] сегодня, [2..4] следующие три дня.
+    WeatherDay days[3];
+    bool has_days = false;
+    bool have_fc = false;
+    ForecastExtra fc;
+    memset(&fc, 0, sizeof(fc));
+    for (int i = 0; i < FC_HOURS; i++) {
+        fc.hourly_t10[i] = FC_NO_TEMP;
+        fc.hourly_rain[i] = FC_NO_VALUE;
+    }
+    for (int i = 0; i < FC_DAYS; i++) {
+        fc.uv10[i] = FC_NO_VALUE;
+    }
+
+    cJSON *daily = cJSON_GetObjectItem(root, "daily");
+    if (daily != nullptr) {
+        cJSON *dtime = cJSON_GetObjectItem(daily, "time");
+        cJSON *dcode = cJSON_GetObjectItem(daily, "weather_code");
+        cJSON *dmax  = cJSON_GetObjectItem(daily, "temperature_2m_max");
+        cJSON *drise = cJSON_GetObjectItem(daily, "sunrise");
+        cJSON *dset  = cJSON_GetObjectItem(daily, "sunset");
+        cJSON *duv   = cJSON_GetObjectItem(daily, "uv_index_max");
+        if (cJSON_IsArray(dtime) && cJSON_IsArray(dcode) && cJSON_IsArray(dmax) &&
+            cJSON_GetArraySize(dtime) >= 5) {
+            has_days = true;
+            for (int i = 0; i < 3; i++) {
+                cJSON *ts = cJSON_GetArrayItem(dtime, i + 2);
+                cJSON *cs = cJSON_GetArrayItem(dcode, i + 2);
+                cJSON *ms = cJSON_GetArrayItem(dmax,  i + 2);
+                if (ts == nullptr || cs == nullptr || ms == nullptr) {
+                    has_days = false;
+                    break;
+                }
+                time_t day_t = (time_t)ts->valuedouble;
+                struct tm tm_day;
+                localtime_r(&day_t, &tm_day);
+                days[i].day  = tm_day.tm_mday;
+                days[i].code = cs->valueint;
+                days[i].tmax = (float)ms->valuedouble;
+            }
+        }
+        // восход, закат, УФ по дням
+        if (cJSON_IsArray(dtime) && cJSON_IsArray(drise) && cJSON_IsArray(dset)) {
+            int n = cJSON_GetArraySize(dtime);
+            if (n > FC_DAYS) n = FC_DAYS;
+            for (int i = 0; i < n; i++) {
+                cJSON *t = cJSON_GetArrayItem(dtime, i);
+                cJSON *r = cJSON_GetArrayItem(drise, i);
+                cJSON *z = cJSON_GetArrayItem(dset, i);
+                if (t != nullptr && cJSON_IsNumber(t)) fc.day_start[i] = (int64_t)t->valuedouble;
+                if (r != nullptr && cJSON_IsNumber(r)) fc.sunrise[i] = (int64_t)r->valuedouble;
+                if (z != nullptr && cJSON_IsNumber(z)) fc.sunset[i] = (int64_t)z->valuedouble;
+                cJSON *u = cJSON_IsArray(duv) ? cJSON_GetArrayItem(duv, i) : nullptr;
+                if (u != nullptr && cJSON_IsNumber(u)) {
+                    int uv10 = (int)(u->valuedouble * 10.0 + 0.5);
+                    fc.uv10[i] = (uint8_t)(uv10 > 254 ? 254 : (uv10 < 0 ? 0 : uv10));
+                }
+            }
+            have_fc = true;
+        }
+    }
+
+    // По часам: сутки назад и трое суток вперёд от текущего часа.
+    cJSON *hourly = cJSON_GetObjectItem(root, "hourly");
+    if (hourly != nullptr) {
+        cJSON *htime = cJSON_GetObjectItem(hourly, "time");
+        cJSON *htemp = cJSON_GetObjectItem(hourly, "temperature_2m");
+        cJSON *hrain = cJSON_GetObjectItem(hourly, "precipitation_probability");
+        if (cJSON_IsArray(htime) && cJSON_IsArray(htemp)) {
+            int64_t start = (ref_now - ref_now % 3600) - 24LL * 3600;
+            fc.hourly_start = start;
+            int n = cJSON_GetArraySize(htime);
+            for (int i = 0; i < n; i++) {
+                cJSON *t = cJSON_GetArrayItem(htime, i);
+                if (t == nullptr || !cJSON_IsNumber(t)) continue;
+                int64_t idx = ((int64_t)t->valuedouble - start) / 3600;
+                if (idx < 0 || idx >= FC_HOURS) continue;
+                cJSON *v = cJSON_GetArrayItem(htemp, i);
+                if (v != nullptr && cJSON_IsNumber(v)) {
+                    fc.hourly_t10[idx] = (int16_t)lround(v->valuedouble * 10.0);
+                }
+                cJSON *r = cJSON_IsArray(hrain) ? cJSON_GetArrayItem(hrain, i) : nullptr;
+                if (r != nullptr && cJSON_IsNumber(r)) {
+                    int p = r->valueint;
+                    fc.hourly_rain[idx] = (uint8_t)(p < 0 ? 0 : (p > 100 ? 100 : p));
+                }
+            }
+            have_fc = true;
+        }
+    }
+    if (have_fc) {
+        fc.magic = kFcMagic;
+        s_fc = fc;
+    }
+
+    s_weather_cache.summary = MakeWeatherSummary(temperature, weather_code);
     s_weather_cache.temperature = temperature;
     s_weather_cache.weather_code = weather_code;
+    s_weather_cache.humidity = humidity;
+    s_weather_cache.has_days = has_days;
+    for (int i = 0; i < 3; i++) {
+        s_weather_cache.days[i] = days[i];
+    }
     s_weather_cache.fetched_at_ms = esp_timer_get_time() / 1000;
+    s_weather_cache.fetched_at_unix = IsTimeValidNow() ? (int64_t)time(nullptr) : 0;
     s_weather_cache.valid = true;
- 
+
     cJSON_Delete(root);
     return true;
 }
@@ -146,12 +525,49 @@ static bool GetWeather(WeatherCache &out) {
     int64_t now_ms = esp_timer_get_time() / 1000;
     if (!s_weather_cache.valid ||
         (now_ms - s_weather_cache.fetched_at_ms) > kWeatherCacheTtlMs) {
-        if (!FetchWeather() && !s_weather_cache.valid) {
+        if (!FetchWeather(Board::GetInstance().GetNetwork()) && !s_weather_cache.valid) {
             return false; // не было ни разу удачного запроса
         }
     }
     out = s_weather_cache;
     return true;
+}
+
+// Перекладывание погоды туда и обратно для RTC-памяти.
+static DeskRtcWeather WeatherToRtc(const WeatherCache& w) {
+    DeskRtcWeather r;
+    memset(&r, 0, sizeof(r));
+    r.valid = w.valid;
+    r.temperature = w.temperature;
+    r.code = (int16_t)w.weather_code;
+    r.humidity = (int16_t)w.humidity;
+    r.has_days = w.has_days;
+    for (int i = 0; i < 3; i++) {
+        r.day[i] = (int8_t)w.days[i].day;
+        r.day_code[i] = (int16_t)w.days[i].code;
+        r.day_tmax[i] = w.days[i].tmax;
+    }
+    r.fetched_unix = w.fetched_at_unix;
+    return r;
+}
+
+static WeatherCache RtcToWeather(const DeskRtcWeather& r) {
+    WeatherCache w;
+    w.valid = r.valid;
+    w.temperature = r.temperature;
+    w.weather_code = r.code;
+    w.humidity = r.humidity;
+    w.has_days = r.has_days;
+    for (int i = 0; i < 3; i++) {
+        w.days[i].day = r.day[i];
+        w.days[i].code = r.day_code[i];
+        w.days[i].tmax = r.day_tmax[i];
+    }
+    w.fetched_at_unix = r.fetched_unix;
+    if (w.valid) {
+        w.summary = MakeWeatherSummary(w.temperature, w.weather_code);
+    }
+    return w;
 }
 
 class CustomBoard : public WifiBoard {
@@ -175,18 +591,13 @@ class CustomBoard : public WifiBoard {
 	esp_timer_handle_t led_timer_ = nullptr;
     bool led_blink_on_ = false;
 	int idle_blink_tick_ = 0;
-	int idle_face_tick_ = 0;
-    int idle_blink_in_ = 30;     // через сколько тиков следующее моргание
-    int idle_bored_in_ = 300;    // через сколько тиков следующая "скука"
-    bool idle_bored_active_ = false;
 	esp_timer_handle_t boot_timer_ = nullptr;
     int boot_frame_ = 0;
 	int wifi_check_tick_ = 0;
     int wifi_warn_cooldown_ = 0;
-    int wifi_warn_hold_ = 0;
-	int idle_anim_hold_ = 0;
-    bool idle_double_blink_ = false;
-	bool wifi_warn_frame_ = false;
+    bool desk_entering_ = false;       // уже переходим в режим часов
+    bool desk_wait_speech_ = false;    // перед сном дождаться конца речи
+    bool sntp_started_ = false;        // точное время из интернета уже запрошено
 	
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {};
@@ -223,6 +634,14 @@ class CustomBoard : public WifiBoard {
         power_->PowerEpdOff();
         power_->VbatPowerOff();
     });
+
+        // Короткое нажатие PWR: уйти в режим часов.
+        pwr_button_.OnClick([this]() {
+            // Первые секунды после включения нажатия не считаем: это
+            // отпускание той самой кнопки, которой устройство включили.
+            if (esp_timer_get_time() < 8000000LL) return;
+            RequestDeskMode(false);
+        });
     }
 
     void UpdateListenLed() {
@@ -267,106 +686,21 @@ class CustomBoard : public WifiBoard {
         }
     }
  
- void UpdateIdleFace() {
-        if (wifi_warn_hold_ > 0) return;
-
-        auto& app = Application::GetInstance();
-        if (app.GetDeviceState() != kDeviceStateIdle ||
-            display_->GetFaceMode() != FaceMode::kIdle) {
-            idle_face_tick_ = 0;
-            idle_bored_active_ = false;
-            idle_anim_hold_ = 0;
-            idle_double_blink_ = false;
-            idle_blink_in_ = 8 + (esp_random() % 12);
-            idle_bored_in_ = 150 + (esp_random() % 150);
-            return;
-        }
-
-        idle_face_tick_++;
-
-        // скучающее лицо держим подольше
-        if (idle_bored_active_) {
-            idle_anim_hold_--;
-            if (idle_anim_hold_ <= 0) {
-                idle_bored_active_ = false;
-                display_->DrawFace(FACE_IDLE);
-                idle_bored_in_ = idle_face_tick_ + 150 + (esp_random() % 150);
-                idle_blink_in_ = idle_face_tick_ + 10 + (esp_random() % 15);
-            }
-            return;
-        }
-
-        // идёт короткое движение, ждём его окончания
-        if (idle_anim_hold_ > 0) {
-            idle_anim_hold_--;
-            if (idle_anim_hold_ == 0) {
-                display_->DrawFace(FACE_IDLE);
-                if (idle_double_blink_) {
-                    idle_double_blink_ = false;
-                    idle_blink_in_ = idle_face_tick_ + 2;   // второе моргание сразу
-                } else {
-                    idle_blink_in_ = idle_face_tick_ + 10 + (esp_random() % 15);
-                }
-            }
-            return;
-        }
-
-        // пора показать очередное движение, выбираем случайно
-        if (idle_face_tick_ >= idle_blink_in_) {
-            int r = esp_random() % 12;
-            if (r < 5) {
-                display_->DrawFace(FACE_IDLE_BLINK);
-                idle_anim_hold_ = 1;
-            } else if (r < 7) {
-                display_->DrawFace(FACE_IDLE_BLINK);
-                idle_anim_hold_ = 1;
-                idle_double_blink_ = true;
-            } else if (r == 7) {
-                display_->DrawFace(FACE_IDLE_WINK_L);
-                idle_anim_hold_ = 2;
-            } else if (r == 8) {
-                display_->DrawFace(FACE_IDLE_WINK_R);
-                idle_anim_hold_ = 2;
-            } else if (r <= 10) {
-                display_->DrawFace(FACE_IDLE_LOOK_L);
-                idle_anim_hold_ = 3;
-            } else {
-                display_->DrawFace(FACE_IDLE_LOOK_R);
-                idle_anim_hold_ = 3;
-            }
-            return;
-        }
-
-        // скучающее лицо, редкое событие
-        if (idle_face_tick_ >= idle_bored_in_) {
-            idle_bored_active_ = true;
-            idle_anim_hold_ = 4;
-            display_->DrawFace(FACE_IDLE_BORED);
-        }
-    }
- 
- 
     // Следит за уровнем сигнала Wi-Fi. Если он слабый, ненадолго
     // показывает лицо с иконкой сигнала, но только в простое и не
     // чаще раза в пять минут, чтобы не надоедать.
    void CheckWifiSignal() {
+        // Точное время из интернета. Запускаем только когда устройство
+        // готово (после проверки обновлений), иначе сервер перезапишет
+        // точное время своим, уже сдвинутым на часовой пояс.
+        if (!sntp_started_ &&
+            Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+            StartSntpOnce();
+        }
+
         if (wifi_warn_cooldown_ > 0) wifi_warn_cooldown_--;
 
         
-        // держим предупреждение на экране, чередуя два кадра
-        if (wifi_warn_hold_ > 0) {
-            wifi_warn_hold_--;
-            if (wifi_warn_hold_ == 0) {
-                display_->RequestFace();
-                return;
-            }
-            // меняем кадр каждые два тика, это восемьсот миллисекунд
-            if (wifi_warn_hold_ % 2 == 0) {
-                wifi_warn_frame_ = !wifi_warn_frame_;
-                display_->DrawFace(wifi_warn_frame_ ? FACE_WIFI_WEAK : FACE_WIFI_WEAK2);
-            }
-            return;
-        }
 
         // проверяем раз в тридцать секунд
         wifi_check_tick_++;
@@ -384,13 +718,26 @@ class CustomBoard : public WifiBoard {
         ESP_LOGI(TAG, "WiFi RSSI: %d", ap.rssi);
         if (ap.rssi > -80) return;
 
-        wifi_warn_frame_ = true;
-        display_->DrawFace(FACE_WIFI_WEAK);
-        wifi_warn_hold_ = 9;         // около трёх с половиной секунд
+        display_->PlayWifiWeak();    // мигающий значок покажет аниматор лица
         wifi_warn_cooldown_ = 750;   // не чаще раза в пять минут
     }
 	
 	
+    // История для графиков в обычном режиме: раз в минуту проверяем,
+    // не пора ли записать новую точку (запись раз в 10 минут и раз в час).
+    int history_tick_ = 140;   // первая проверка через несколько секунд после старта
+    void HistoryTick() {
+        history_tick_++;
+        if (history_tick_ < 150) return;   // 150 тиков по 400 мс = минута
+        history_tick_ = 0;
+        if (time(nullptr) < 1600000000) return;
+        int64_t now = (int64_t)time(nullptr);
+        if (now / 600 == s_hist.room_last_slot && now / 3600 == s_hist.batt_last_slot) return;
+        float t = 0, h = 0;
+        bool ok = ReadSHTC3(t, h);
+        HistRecord(ok, t, h, (int)BatterygetPercent());
+    }
+
     // Запускает таймер мигания. Период 400 мс даёт спокойное,
     // заметное мигание. Меньше значение, быстрее моргает.
     void StartListenLed() {
@@ -398,8 +745,8 @@ class CustomBoard : public WifiBoard {
           args.callback = [](void* arg) {
             auto* self = static_cast<CustomBoard*>(arg);
             self->UpdateListenLed();
-            self->UpdateIdleFace();
             self->CheckWifiSignal();
+            self->HistoryTick();
         };
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
@@ -417,31 +764,13 @@ class CustomBoard : public WifiBoard {
        
 	   void InitializeTools() {
 		    auto &mcp_server = McpServer::GetInstance();
-			// показать погоду на экране
-        mcp_server.AddTool(
-            "self.screen.show_weather",
-            "Show the current weather on the device screen for ten seconds. "
-            "Call this when the user asks to SHOW the weather on the screen, "
-            "покажи погоду, выведи погоду на экран. "
-            "You can call it together with telling the weather out loud. "
-            "The device keeps talking while the screen shows the weather.",
-            PropertyList(),
-            [this](const PropertyList &) -> ReturnValue {
-                WeatherCache w;
-                if (!GetWeather(w)) {
-                    return std::string("{\"success\":false}");
-                }
-                char line1[32];
-                snprintf(line1, sizeof(line1), "%.0f C", w.temperature);
-                std::string desc = WeatherCodeToText(w.weather_code);
-                display_->ShowTextWidget(line1, desc.c_str(), 10);
-                return std::string("{\"success\":true}");
-            });
+			
 //wifi
         mcp_server.AddTool("self.disp.network", "Reconfigure WiFi connection", PropertyList(), [this](const PropertyList &) -> ReturnValue {
             EnterWifiConfigMode();
             return true;
         });
+				
 
 // монетка
         mcp_server.AddTool(
@@ -465,24 +794,37 @@ class CustomBoard : public WifiBoard {
     "Call this every time the user asks about weather, temperature, "
     "what's it like outside, погода, температура на улице. "
     "Returns a short description of current conditions and temperature. "
-    "Announce the result to the user in their language.",
-    PropertyList(),
-    [this](const PropertyList &) -> ReturnValue {
-        WeatherCache w;
-        if (!GetWeather(w)) {
-            return std::string("Не удалось получить данные о погоде, попробуйте позже");
-        }
-        return w.summary;
-    });
+    "Announce the result to the user in their language. "
+    "The device shows the result on its small screen for about twelve "
+    "seconds, then the screen goes back to the face. Call this tool every "
+    "time the user asks, including when they ask to show it again. "
+    "Never say that it is already on the screen. ",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                WeatherCache w;
+                if (!GetWeather(w)) {
+                    return std::string("Не удалось получить данные о погоде, попробуйте позже");
+                }
+                display_->ShowWeatherWidget(w, 12);
+                return w.summary;
+            });
 			
 //температура и влажность на датчике
-        mcp_server.AddTool("self.sensor.get_room_climate",
-            "Get current room temperature in Celsius and humidity in percent from the built-in sensor",
+        mcp_server.AddTool(
+            "self.sensor.get_room_climate",
+            "Get current room temperature in Celsius and humidity in percent from the built-in sensor. "
+            "Call this every time the user asks about the room, home temperature "
+            "or humidity, температура дома, в комнате, влажность. "
+            "The device shows these values on its small screen for about twelve "
+            "seconds, then the screen goes back to the face. Call this tool every "
+            "time the user asks, including when they ask to show it again. "
+            "Never say that it is already on the screen. ",
             PropertyList(), [this](const PropertyList &) -> ReturnValue {
                 float t = 0, h = 0;
                 if (!ReadSHTC3(t, h)) {
                     return std::string("{\"success\":false}");
                 }
+                display_->ShowRoomWidget(t, h, 12);
                 char buf[96];
                 snprintf(buf, sizeof(buf),
                     "{\"success\":true,\"temperature\":%.1f,\"humidity\":%.1f}", t, h);
@@ -629,11 +971,28 @@ mcp_server.AddTool(
         }
         return std::string("{\"success\":true}");
     });
-	  
-	
+
+// режим часов по голосу
+        mcp_server.AddTool(
+            "self.power.desk_mode",
+            "Switch the device into the autonomous desk clock mode (deep sleep). "
+            "The screen then shows a clock, the room climate and the weather and "
+            "updates itself every minute, while the voice assistant is off until "
+            "the user presses the PWR button. "
+            "Call this when the user asks to go to sleep mode, desk mode or clock "
+            "mode, for example \"режим часов\", \"спящий режим\", \"засыпай\", "
+            "\"усни\", \"режим экономии\", \"go to sleep\". "
+            "Do NOT call this for turning the device off, use self.power.shutdown for that. "
+            "After calling, say a very short goodbye in the user's language, the "
+            "device switches right after it finishes speaking.",
+            PropertyList(),
+            [this](const PropertyList &) -> ReturnValue {
+                RequestDeskMode(true);
+                return std::string("{\"success\":true}");
+            });
     }
 
-    void InitializeLcdDisplay() {
+    void InitializeLcdDisplay(bool quick_start = false) {
         custom_lcd_spi_t lcd_spi_data = {};
         lcd_spi_data.cs               = EPD_CS_PIN;
         lcd_spi_data.dc               = EPD_DC_PIN;
@@ -643,7 +1002,7 @@ mcp_server.AddTool(
         lcd_spi_data.scl              = EPD_SCK_PIN;
         lcd_spi_data.spi_host         = EPD_SPI_NUM;
         lcd_spi_data.buffer_len       = 5000;
-        display_                      = new CustomLcdDisplay(NULL, NULL, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY, lcd_spi_data);
+        display_                      = new CustomLcdDisplay(NULL, NULL, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY, lcd_spi_data, quick_start);
     }
 
     void Power_Init() {
@@ -651,6 +1010,14 @@ mcp_server.AddTool(
         power_->VbatPowerOn();
         power_->PowerAudioOn();
         power_->PowerEpdOn();
+        // После режима часов линии питания и светодиод могли остаться
+        // "замороженными" на время сна. Уровни уже выставлены выше,
+        // теперь отпускаем заморозку.
+        gpio_hold_dis(VBAT_PWR_PIN);
+        gpio_hold_dis(EPD_PWR_PIN);
+        gpio_hold_dis(Audio_PWR_PIN);
+        gpio_hold_dis(GPIO_NUM_3);
+        gpio_deep_sleep_hold_dis();
         do {
             vTaskDelay(pdMS_TO_TICKS(10));
         } while (!gpio_get_level(VBAT_PWR_GPIO));
@@ -679,6 +1046,7 @@ mcp_server.AddTool(
                if (app.GetDeviceState() == kDeviceStateIdle) {
             ESP_LOGI(TAG, "Auto listen: device ready, saying hello");
             esp_timer_stop(autolisten_timer_);
+            StartSntpOnce();
             app.WakeWordInvoke("Привет!!!"); //Говорит после пробуждения
             return;
         }
@@ -693,12 +1061,64 @@ mcp_server.AddTool(
     }
  //экран загрузки, неблокирующий: кадры идут по таймеру,
  //параллельно с подключением к сети
- static constexpr int kBootFrameMs = 1800;   // 6 кадров, всего 12 секунд - ВРЕМЯ ЭКРАНА ЗАГРУЗКИ
+ static constexpr int kBootFrameMs = 1800;   // обычное включение: 6 кадров по 1.8 с - ВРЕМЯ ЭКРАНА ЗАГРУЗКИ
+ static constexpr int kBootTickMs = 300;     // шаг таймера анимации загрузки
+
+ // Кадр анимации загрузки: целое лицо (full >= 0) или глаза + рот.
+ struct BootStep {
+     int16_t full;
+     int8_t eyes;
+     int8_t mouth;
+     int16_t ms;
+ };
+
+ // Обычное включение: прежняя анимация с рамкой.
+ static constexpr BootStep kColdBoot[] = {
+     { FACE_BOOT_0, -1, -1, kBootFrameMs }, { FACE_BOOT_1, -1, -1, kBootFrameMs },
+     { FACE_BOOT_2, -1, -1, kBootFrameMs }, { FACE_BOOT_3, -1, -1, kBootFrameMs },
+     { FACE_BOOT_4, -1, -1, kBootFrameMs }, { FACE_BOOT_5, -1, -1, kBootFrameMs },
+ };
+
+ // Выход из режима часов: просыпается. Спит, приоткрывает глаз, зевает,
+ // моргает, оглядывается и улыбается. Идёт, пока подключается Wi-Fi.
+ static constexpr BootStep kWakeUp[] = {
+     { -1, EYES_SLEEP_Z1, MOUTH_FLAT,  1200 },
+     { -1, EYES_SLEEP_Z2, MOUTH_FLAT,  1200 },
+     { -1, EYES_WINK_L,   MOUTH_FLAT,  1200 },   // приоткрыл один глаз
+     { -1, EYES_CLOSED,   MOUTH_YAWN,  1800 },   // зевает
+     { -1, EYES_SLEEPY,   MOUTH_FLAT,  1200 },
+     { -1, EYES_CLOSED,   MOUTH_IDLE,   600 },   // моргнул
+     { -1, EYES_OPEN,     MOUTH_IDLE,   600 },
+     { -1, EYES_LOOK_L,   MOUTH_IDLE,  1200 },   // огляделся
+     { -1, EYES_LOOK_R,   MOUTH_IDLE,  1200 },
+     { -1, EYES_HAPPY,    MOUTH_SMILE, 1200 },   // привет!
+ };
+
+ const BootStep* boot_steps_ = kColdBoot;
+ int boot_step_count_ = 0;
+ int boot_step_left_ms_ = 0;
+ bool woke_from_desk_ = false;   // этот запуск: выход из режима часов
+
+ void DrawBootStep(const BootStep& st) {
+     if (st.full >= 0) {
+         display_->DrawFace(st.full);
+     } else {
+         display_->DrawFaceParts(st.eyes, st.mouth);
+     }
+ }
 
  void ShowBootProgress() {
     display_->SetBooting(true);
+    if (woke_from_desk_) {
+        boot_steps_ = kWakeUp;
+        boot_step_count_ = sizeof(kWakeUp) / sizeof(kWakeUp[0]);
+    } else {
+        boot_steps_ = kColdBoot;
+        boot_step_count_ = sizeof(kColdBoot) / sizeof(kColdBoot[0]);
+    }
     boot_frame_ = 0;
-    display_->DrawFace(FACE_BOOT_0);
+    boot_step_left_ms_ = boot_steps_[0].ms;
+    DrawBootStep(boot_steps_[0]);
 
     esp_timer_create_args_t args = {};
     args.callback = [](void* arg) {
@@ -714,24 +1134,31 @@ mcp_server.AddTool(
         display_->SetBooting(false);
         return;
     }
-    esp_timer_start_periodic(boot_timer_, kBootFrameMs * 1000);
+    esp_timer_start_periodic(boot_timer_, kBootTickMs * 1000);
 }
 
  void NextBootFrame() {
-    static const int frames[] = {
-        FACE_BOOT_0, FACE_BOOT_1, FACE_BOOT_2,
-        FACE_BOOT_3, FACE_BOOT_4, FACE_BOOT_5
-    };
-    const int count = sizeof(frames) / sizeof(frames[0]);
+    boot_step_left_ms_ -= kBootTickMs;
+    if (boot_step_left_ms_ > 0) return;   // текущий кадр ещё показываем
 
     boot_frame_++;
-    if (boot_frame_ >= count) {
+    if (boot_frame_ >= boot_step_count_) {
         esp_timer_stop(boot_timer_);
         display_->SetBooting(false);
-        display_->RequestFace();
+        // Если за время загрузки он уже успел заговорить или слушает,
+        // сразу рисуем правильное лицо, а не обычное.
+        auto state = Application::GetInstance().GetDeviceState();
+        if (state == kDeviceStateListening) {
+            display_->SetStatus(Lang::Strings::LISTENING);
+        } else if (state == kDeviceStateSpeaking) {
+            display_->SetStatus(Lang::Strings::SPEAKING);
+        } else {
+            display_->RequestFace();
+        }
         return;
     }
-    display_->DrawFace(frames[boot_frame_]);
+    boot_step_left_ms_ = boot_steps_[boot_frame_].ms;
+    DrawBootStep(boot_steps_[boot_frame_]);
 }
  
     // Запускает периодическую проверку готовности устройства.
@@ -849,20 +1276,31 @@ mcp_server.AddTool(
             }
         }
 
-        // Wakeup
+        // Пробуждение. Раньше тут стояло pdMS_TO_TICKS(2), что при тике
+        // в десять миллисекунд давало ноль тиков, и датчик не успевал
+        // проснуться до команды измерения.
         uint8_t wakeup[2] = {0x35, 0x17};
         i2c_master_transmit(shtc3_dev, wakeup, 2, 100);
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(20));
 
-        // Measure T first, normal mode, clock stretching disabled
+        // Измерение, обычный режим, без растягивания такта.
         uint8_t cmd[2] = {0x78, 0x66};
-        if (i2c_master_transmit(shtc3_dev, cmd, 2, 100) != ESP_OK) {
+        esp_err_t cerr = ESP_FAIL;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            cerr = i2c_master_transmit(shtc3_dev, cmd, 2, 100);
+            if (cerr == ESP_OK) {
+                break;
+            }
+            i2c_master_transmit(shtc3_dev, wakeup, 2, 100);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (cerr != ESP_OK) {
             ESP_LOGE(TAG, "SHTC3: measure cmd failed");
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
 
-                uint8_t data[6] = {0};
+        uint8_t data[6] = {0};
         esp_err_t rerr = ESP_FAIL;
         for (int attempt = 0; attempt < 3; attempt++) {
             rerr = i2c_master_receive(shtc3_dev, data, 6, 100);
@@ -876,7 +1314,7 @@ mcp_server.AddTool(
             return false;
         }
 
-        // Sleep
+        // Усыпляем датчик до следующего чтения.
         uint8_t sleep_cmd[2] = {0xB0, 0x98};
         i2c_master_transmit(shtc3_dev, sleep_cmd, 2, 100);
 
@@ -890,8 +1328,410 @@ mcp_server.AddTool(
         return true;
     }
 	
+
+    // ================================================================
+    // ===================== РЕЖИМ ЧАСОВ (deep sleep) ==================
+    // ================================================================
+    //
+    // Как это работает:
+    // 1. Короткое нажатие PWR или голосом "режим часов": рисуем часы,
+    //    выключаем звук и экран и засыпаем глубоким сном.
+    // 2. Раз в минуту просыпаемся, обновляем экран без мигания и снова спим.
+    //    Ассистент при этом не запускается, поэтому это быстро.
+    // 3. Раз в сутки при пробуждении подключаемся к Wi-Fi, берём точное
+    //    время и погоду. Нет Wi-Fi: показываем что есть, попробуем через сутки.
+    // 4. BOOT во сне: следующая страница (часы, погода, комната).
+    // 5. PWR коротко во сне: выход в обычный режим с ассистентом.
+    //    PWR долго во сне: выключение.
+
+    // Запоминаем нарисованный кадр, чтобы после сна обновлять только разницу.
+    void DeskSaveFrame(bool was_full) {
+        int n = display_->FrameSize();
+        if (n > kDeskFrameBytes) n = kDeskFrameBytes;
+        memcpy(s_desk.frame, display_->FrameBuffer(), n);
+        s_desk.frame_valid = true;
+        s_desk.updates_since_full = was_full ? 0 : s_desk.updates_since_full + 1;
+    }
+
+    // Ждёт, пока отпустят кнопку. Возвращает, сколько её держали (мс).
+    int WaitRelease(gpio_num_t pin, int max_ms) {
+        int held = 0;
+        while (gpio_get_level(pin) == 0 && held < max_ms) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            held += 20;
+        }
+        return held;
+    }
+
+    // Сколько спать до следующего обновления: просыпаемся сразу после
+    // смены минуты, чтобы часы на экране не отставали.
+    int64_t DeskMicrosToNextWake() {
+        const int64_t period = (int64_t)kDeskWakeSec * 1000000;
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        if (tv.tv_sec < 1600000000) {
+            return period;   // времени нет, просто через период
+        }
+        int64_t into = (int64_t)(tv.tv_sec % kDeskWakeSec) * 1000000 + tv.tv_usec;
+        int64_t us = period - into + 300000;
+        if (us < 300000) us = 300000;
+        return us;
+    }
+
+    // Засыпание. with_timer = false: спим до нажатия PWR, без будильника
+    // (так выглядит "выключено", когда питание идёт от USB).
+    // keep_power = false: отпустить защёлку питания от батареи.
+    void DeskGoToSleep(bool with_timer, bool keep_power) {
+        // Кнопки должны быть отпущены, иначе сразу же проснёмся.
+        WaitRelease(BOOT_BUTTON_GPIO, 3000);
+        WaitRelease(VBAT_PWR_GPIO, 3000);
+
+        gpio_set_level(Audio_PWR_PIN, 1);                 // звук и датчик выключены
+        gpio_set_level(EPD_PWR_PIN, 1);                   // экран выключен, картинка остаётся
+        gpio_set_level(VBAT_PWR_PIN, keep_power ? 1 : 0); // защёлка питания от батареи
+
+        // Замораживаем эти линии на время сна, иначе они "поплывут"
+        // и плата от батареи просто выключится.
+        gpio_hold_en(VBAT_PWR_PIN);
+        gpio_hold_en(EPD_PWR_PIN);
+        gpio_hold_en(Audio_PWR_PIN);
+        gpio_hold_en(GPIO_NUM_3);                         // светодиод остаётся погашенным
+        gpio_deep_sleep_hold_en();
+
+        // Будим кнопками. Кнопку, которая почему-то зажата, не берём,
+        // иначе устройство будет просыпаться без конца.
+        uint64_t mask = 0;
+        if (gpio_get_level(VBAT_PWR_GPIO) == 1) {
+            mask |= 1ULL << VBAT_PWR_GPIO;
+        }
+        if (with_timer && gpio_get_level(BOOT_BUTTON_GPIO) == 1) {
+            mask |= 1ULL << BOOT_BUTTON_GPIO;
+        }
+        if (mask != 0) {
+            esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+            if (mask & (1ULL << VBAT_PWR_GPIO)) {
+                rtc_gpio_pullup_en(VBAT_PWR_GPIO);
+                rtc_gpio_pulldown_dis(VBAT_PWR_GPIO);
+            }
+            if (mask & (1ULL << BOOT_BUTTON_GPIO)) {
+                rtc_gpio_pullup_en(BOOT_BUTTON_GPIO);
+                rtc_gpio_pulldown_dis(BOOT_BUTTON_GPIO);
+            }
+        }
+
+        if (with_timer) {
+            int64_t us = DeskMicrosToNextWake();
+            esp_sleep_enable_timer_wakeup(us);
+            ESP_LOGI(TAG, "Desk: sleep for %lld ms", (long long)(us / 1000));
+        } else {
+            ESP_LOGI(TAG, "Desk: sleep until PWR");
+        }
+        esp_deep_sleep_start();
+    }
+
+    // Включение питания при пробуждении. Уровни выставляем ДО того, как
+    // отпустить заморозку, чтобы защёлка батареи не мигнула в ноль.
+    void DeskPowerOn() {
+        gpio_config_t io = {};
+        io.mode = GPIO_MODE_OUTPUT;
+        io.pin_bit_mask = (1ULL << VBAT_PWR_PIN) | (1ULL << EPD_PWR_PIN) | (1ULL << Audio_PWR_PIN);
+        io.pull_up_en = GPIO_PULLUP_ENABLE;
+        io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io.intr_type = GPIO_INTR_DISABLE;
+        gpio_config(&io);
+        gpio_set_level(VBAT_PWR_PIN, 1);    // питание от батареи держим
+        gpio_set_level(EPD_PWR_PIN, 0);     // экран включён
+        gpio_set_level(Audio_PWR_PIN, 0);   // эту линию тоже, на ней может сидеть датчик
+        gpio_hold_dis(VBAT_PWR_PIN);
+        gpio_hold_dis(EPD_PWR_PIN);
+        gpio_hold_dis(Audio_PWR_PIN);
+        gpio_deep_sleep_hold_dis();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Собирает данные для экрана: датчик, батарея, погода из памяти.
+    void DeskCollect(DeskScreenData& d) {
+        d.weather = RtcToWeather(s_desk.weather);
+        float t = 0, h = 0;
+        d.room_ok = ReadSHTC3(t, h);
+        d.room_t = t;
+        d.room_h = h;
+        d.battery = (int)BatterygetPercent();
+        HistRecord(d.room_ok, d.room_t, d.room_h, d.battery);
+        FillChartData(d);
+    }
+
+    // Подключение к Wi-Fi во сне, без запуска ассистента.
+    // Берём сети, которые уже сохранены при настройке устройства.
+    bool DeskWifiConnect() {
+        const auto& list = SsidManager::GetInstance().GetSsidList();
+        if (list.empty()) {
+            ESP_LOGW(TAG, "Desk: no saved Wi-Fi");
+            return false;
+        }
+
+        esp_netif_init();
+        esp_event_loop_create_default();
+        esp_netif_create_default_wifi_sta();
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        cfg.nvs_enable = false;
+        if (esp_wifi_init(&cfg) != ESP_OK) {
+            ESP_LOGE(TAG, "Desk: wifi init failed");
+            return false;
+        }
+        s_desk_wifi_events = xEventGroupCreate();
+        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &DeskWifiEvent, nullptr);
+        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &DeskWifiEvent, nullptr);
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_start();
+
+        int networks = (int)list.size();
+        if (networks > 2) networks = 2;   // больше двух сетей не перебираем, бережём батарею
+        for (int i = 0; i < networks; i++) {
+            wifi_config_t wc = {};
+            size_t sl = list[i].ssid.size();
+            if (sl > sizeof(wc.sta.ssid)) sl = sizeof(wc.sta.ssid);
+            memcpy(wc.sta.ssid, list[i].ssid.data(), sl);
+            size_t pl = list[i].password.size();
+            if (pl >= sizeof(wc.sta.password)) pl = sizeof(wc.sta.password) - 1;
+            memcpy(wc.sta.password, list[i].password.data(), pl);
+            esp_wifi_set_config(WIFI_IF_STA, &wc);
+
+            ESP_LOGI(TAG, "Desk: connecting to %s", list[i].ssid.c_str());
+            int64_t deadline = esp_timer_get_time() + (int64_t)kDeskWifiTimeoutMs * 1000;
+            xEventGroupClearBits(s_desk_wifi_events, kDeskWifiGotIp | kDeskWifiLost);
+            esp_wifi_connect();
+            while (true) {
+                int64_t left_ms = (deadline - esp_timer_get_time()) / 1000;
+                if (left_ms <= 0) break;
+                EventBits_t bits = xEventGroupWaitBits(s_desk_wifi_events,
+                    kDeskWifiGotIp | kDeskWifiLost, pdTRUE, pdFALSE, pdMS_TO_TICKS(left_ms));
+                if (bits & kDeskWifiGotIp) {
+                    ESP_LOGI(TAG, "Desk: Wi-Fi connected");
+                    return true;
+                }
+                if (bits & kDeskWifiLost) {
+                    // не получилось с первого раза, пробуем ещё, пока есть время
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_wifi_connect();
+                }
+            }
+            esp_wifi_disconnect();
+        }
+        ESP_LOGW(TAG, "Desk: Wi-Fi not available");
+        return false;
+    }
+
+    // Раз в сутки: точное время и свежая погода.
+    void DeskSync() {
+        // Попытка одна в сутки, даже неудачная: без бесконечных повторов,
+        // чтобы не посадить батарею, если роутер выключен.
+        s_desk.last_sync = time(nullptr);
+
+        if (DeskWifiConnect()) {
+            esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            esp_netif_sntp_init(&sntp_cfg);
+            if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(8000)) == ESP_OK) {
+                s_sntp_synced = true;
+                ESP_LOGI(TAG, "Desk: time synced");
+            } else {
+                ESP_LOGW(TAG, "Desk: time sync failed");
+            }
+            esp_netif_sntp_deinit();
+
+            if (FetchWeather(WifiBoard::GetNetwork())) {
+                s_desk.weather = WeatherToRtc(s_weather_cache);
+                ESP_LOGI(TAG, "Desk: weather updated");
+            }
+            // время могло сильно поменяться после синхронизации
+            s_desk.last_sync = time(nullptr);
+        }
+        esp_wifi_stop();
+    }
+
+    // Долгое нажатие PWR во сне: выключение.
+    void DeskShutdown() {
+        InitializeLcdDisplay(true);
+        display_->RenderFaceAfterWake(FACE_DEAD, s_desk.frame_valid ? s_desk.frame : nullptr);
+        display_->EPD_Sleep();
+        s_desk.active = false;
+        s_desk.frame_valid = false;
+
+        gpio_set_level(EPD_PWR_PIN, 1);
+        gpio_set_level(Audio_PWR_PIN, 1);
+        gpio_set_level(VBAT_PWR_PIN, 0);   // отпускаем питание от батареи
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        // Если мы всё ещё живы, значит питание от USB. Тогда спим
+        // до нажатия PWR, после него будет обычный запуск.
+        DeskGoToSleep(false, false);
+    }
+
+    // Главное: что делать при пробуждении в режиме часов.
+    // Возвращается, только если пора выйти в обычный режим.
+    void RunDeskWake() {
+        uint64_t pins = esp_sleep_get_ext1_wakeup_status();
+        bool by_pwr  = (pins & (1ULL << VBAT_PWR_GPIO)) != 0;
+        bool by_boot = (pins & (1ULL << BOOT_BUTTON_GPIO)) != 0;
+        ESP_LOGI(TAG, "Desk wake: pwr=%d boot=%d page=%d", by_pwr, by_boot, s_desk.page);
+
+        DeskPowerOn();
+
+        if (by_pwr) {
+            int held = WaitRelease(VBAT_PWR_GPIO, 4000);
+            if (held >= kDeskLongPressMs) {
+                DeskShutdown();   // сюда не возвращаемся
+            }
+            ESP_LOGI(TAG, "Desk: exit to normal mode");
+            s_desk.active = false;
+            return;   // дальше обычный запуск с ассистентом
+        }
+
+        if (by_boot) {
+            s_desk.page = (s_desk.page + 1) % DESK_PAGE_COUNT;
+        }
+
+        InitializeI2c();
+
+        // Раз в сутки в сеть. По нажатию BOOT не ходим, чтобы страница
+        // переключалась сразу, сходим при следующем обычном пробуждении.
+        time_t now = time(nullptr);
+        bool need_sync = !by_boot &&
+            (s_desk.last_sync == 0 || now < s_desk.last_sync ||
+             (now - s_desk.last_sync) >= kDeskSyncSec);
+        if (need_sync) {
+            DeskSync();
+        }
+
+        // Данные крупные (графики), поэтому в куче, а не на стеке.
+        auto d = std::make_unique<DeskScreenData>();
+        DeskCollect(*d);
+
+        bool full = !s_desk.frame_valid || s_desk.updates_since_full >= kDeskFullRefreshEvery;
+        InitializeLcdDisplay(true);
+        // Полоска страниц видна, когда листаешь кнопкой BOOT. На следующем
+        // обновлении через минуту она пропадает (или всегда, см. kDeskPageBarAlways).
+        display_->RenderDeskPage(s_desk.page, *d, full ? nullptr : s_desk.frame,
+                                 by_boot || kDeskPageBarAlways);
+        DeskSaveFrame(full);
+        display_->EPD_Sleep();
+
+        DeskGoToSleep(true, true);
+    }
+
+    // Переход в режим часов из обычного режима.
+    void RequestDeskMode(bool wait_for_speech) {
+        if (desk_entering_) return;
+        desk_entering_ = true;
+        desk_wait_speech_ = wait_for_speech;
+        xTaskCreate([](void* arg) {
+            static_cast<CustomBoard*>(arg)->EnterDeskModeTask();
+            vTaskDelete(nullptr);
+        }, "desk_enter", 12288, this, 5, nullptr);
+    }
+
+    void EnterDeskModeTask() {
+        auto& app = Application::GetInstance();
+
+        // По голосу: даём договорить прощание. Ждём, пока начнёт говорить
+        // (до 6 секунд), потом пока закончит (всего до 25 секунд).
+        if (desk_wait_speech_) {
+            int waited = 0;
+            while (app.GetDeviceState() != kDeviceStateSpeaking && waited < 6000) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                waited += 200;
+            }
+            while (app.GetDeviceState() == kDeviceStateSpeaking && waited < 25000) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                waited += 200;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        ESP_LOGI(TAG, "Entering desk mode");
+
+        // Останавливаем всё, что может рисовать лица.
+        if (led_timer_) esp_timer_stop(led_timer_);
+        if (boot_timer_) esp_timer_stop(boot_timer_);
+        if (autolisten_timer_) esp_timer_stop(autolisten_timer_);
+        display_->SetShuttingDown(true);
+        // Засыпает, два кадра: глаза слипаются, потом спит с "Z".
+        // Второй кадр остаётся на экране, пока собираются данные для часов.
+        // Ждать чужое рисование не нужно: экран защищён общей блокировкой.
+        display_->DrawFaceParts(EYES_SLEEPY, MOUTH_FLAT);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        display_->DrawFaceParts(EYES_SLEEP_Z2, MOUTH_FLAT);
+
+        // Данные для первого экрана. Сеть сейчас есть, погоду берём свежую.
+        auto dp = std::make_unique<DeskScreenData>();
+        DeskScreenData& d = *dp;
+        WeatherCache w;
+        if (GetWeather(w)) {
+            d.weather = w;
+        }
+        float t = 0, h = 0;
+        d.room_ok = ReadSHTC3(t, h);
+        d.room_t = t;
+        d.room_h = h;
+        d.battery = (int)BatterygetPercent();
+        HistRecord(d.room_ok, d.room_t, d.room_h, d.battery);
+        FillChartData(d);
+
+        memset(&s_desk, 0, sizeof(s_desk));
+        s_desk.magic = kDeskMagic;
+        s_desk.active = true;
+        s_desk.page = DESK_PAGE_CLOCK;
+        s_desk.weather = WeatherToRtc(d.weather);
+        // Если точное время из интернета и погода уже есть, в сеть пойдём через сутки,
+        // иначе при первом же пробуждении (заодно исправится неверное время).
+        s_desk.last_sync = (s_sntp_synced && d.weather.valid) ? time(nullptr) : 0;
+
+        power_->PowerAudioOff();
+        power_->LedOff();
+
+        display_->RenderDeskPage(DESK_PAGE_CLOCK, d, nullptr, true);   // полное обновление
+        DeskSaveFrame(true);
+        display_->EPD_Sleep();
+
+        esp_wifi_stop();
+        DeskGoToSleep(true, true);
+    }
+
+    // Точное время из интернета в обычном режиме. Запускается один раз,
+    // дальше само подстраивается раз в час.
+    void StartSntpOnce() {
+        if (sntp_started_) return;
+        sntp_started_ = true;
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        cfg.sync_cb = OnSntpSync;
+        esp_netif_sntp_init(&cfg);
+    }
+
   public:
     CustomBoard() : boot_button_(BOOT_BUTTON_GPIO), pwr_button_(VBAT_PWR_GPIO) {
+        setenv("TZ", kTimeZone, 1);
+        tzset();
+        HistEnsureLoaded();
+
+        // Проснулись в режиме часов? Тогда обновляем экран и засыпаем обратно,
+        // обычный запуск ассистента не нужен. Сюда возвращаемся, только если
+        // нажали PWR, то есть пора выйти в обычный режим.
+        if (s_desk.magic == kDeskMagic && s_desk.active) {
+            if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+                RunDeskWake();
+                woke_from_desk_ = true;   // сюда попадаем, только если вышли из режима часов
+            } else {
+                s_desk.active = false;   // перезагрузка не из сна: обычный режим
+            }
+        }
+
+        // Погода, которую помнил режим часов, пригодится как запасная,
+        // но при первом вопросе всё равно обновится из сети.
+        if (s_desk.magic == kDeskMagic && s_desk.weather.valid && !s_weather_cache.valid) {
+            s_weather_cache = RtcToWeather(s_desk.weather);
+            s_weather_cache.fetched_at_ms = -kWeatherCacheTtlMs - 1;
+        }
+
         Power_Init();
         InitializeI2c();
         InitializeButtons();
@@ -904,6 +1744,13 @@ mcp_server.AddTool(
 
     virtual AudioCodec *GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
+        // Чувствительность микрофона. Ставится один раз, до первого включения
+        // микрофона, поэтому применяется сразу.
+        static bool gain_set = false;
+        if (!gain_set) {
+            gain_set = true;
+            audio_codec.SetInputGain(kMicGainDb);
+        }
         return &audio_codec;
     }
 
