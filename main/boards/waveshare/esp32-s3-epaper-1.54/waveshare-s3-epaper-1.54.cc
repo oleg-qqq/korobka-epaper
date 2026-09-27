@@ -78,6 +78,21 @@ static constexpr bool kDeskPageBarAlways = false;          // true: полоск
 // ===== ВИДЖЕТЫ ПО ГОЛОСУ =====
 static constexpr int kVoiceWidgetSec = 15;   // сколько секунд виджет на экране во время разговора
 
+// ===== БУДИЛЬНИКИ, НАПОМИНАНИЯ, ТАЙМЕР =====
+static constexpr int kAlarmRingSec = 120;        // сколько звонит будильник, если никто не нажал
+static constexpr int kAlarmSnoozeMin = 9;        // BOOT во время звонка: отложить на столько минут
+static constexpr int kAlarmVolume = 80;          // громкость звонка, %
+static constexpr int kReminderShowMin = 10;      // сколько напоминание висит на экране
+static constexpr int kTimerDoneShowSec = 60;     // сколько висит "время вышло"
+static constexpr int kQrShowMin = 5;             // QR с паролем Wi-Fi убирается сам через столько минут
+
+// ===== НОЧНАЯ ЭКОНОМИЯ (режим часов) =====
+// С kNightFromHour до kNightToHour экран обновляется раз в kNightWakeSec.
+// Будильники и напоминания всё равно срабатывают минута в минуту.
+static constexpr int kNightFromHour = 1;
+static constexpr int kNightToHour = 6;
+static constexpr int kNightWakeSec = 600;
+
 // ===== АВТОСОН =====
 // Если столько минут подряд никто не разговаривает, устройство само
 // уходит в режим часов (как по кнопке PWR). 0 = никогда не засыпать.
@@ -580,6 +595,268 @@ static WeatherCache RtcToWeather(const DeskRtcWeather& r) {
     return w;
 }
 
+
+// ===== ВОЗДУХ И МОРЕ (Open-Meteo) =====
+// Точка в море у Лимассола. cell_selection=sea: брать ближайшую морскую клетку.
+static constexpr double kSeaLat = 34.66;
+static constexpr double kSeaLon = 33.04;
+static constexpr int64_t kAirCacheTtlMs = 30 * 60 * 1000;   // в обычном режиме не чаще раза в 30 минут
+static constexpr int64_t kSeaCacheTtlMs = 60 * 60 * 1000;   // море меняется медленнее
+
+static RTC_DATA_ATTR AirCache s_air;
+static RTC_DATA_ATTR SeaCache s_sea;
+static int64_t s_air_fetch_ms = 0;   // время работы при последнем запросе (0 = ещё не было)
+static int64_t s_sea_fetch_ms = 0;
+
+// GET-запрос, ответ разобран как JSON. nullptr при ошибке. Удалять через cJSON_Delete.
+template <typename Net>
+static cJSON* HttpGetJson(Net* network, const char* url, const char* tag) {
+    auto http = network->CreateHttp(0);
+    if (http == nullptr) return nullptr;
+    http->SetHeader("User-Agent", SystemInfo::GetUserAgent());
+    if (auto opened = http->Open("GET", url); !opened) {
+        ESP_LOGE(tag, "HTTP open failed: %s", opened.error().ToString().c_str());
+        return nullptr;
+    }
+    auto status = http->GetStatusCode();
+    if (!status || *status != 200) {
+        ESP_LOGE(tag, "HTTP status error");
+        http->Close();
+        return nullptr;
+    }
+    std::string body = http->ReadAll();
+    http->Close();
+    if (body.empty()) return nullptr;
+    return cJSON_Parse(body.c_str());
+}
+
+static uint16_t JsonU16(cJSON* item, float mul) {
+    if (item == nullptr || !cJSON_IsNumber(item)) return AQ_NONE;
+    double v = item->valuedouble * mul;
+    if (v < 0) v = 0;
+    if (v > 65000) v = 65000;
+    return (uint16_t)lround(v);
+}
+
+// Раскладывает почасовой ряд так, чтобы [0] был началом текущего часа.
+static void FillHourly(cJSON* times, cJSON* values, int64_t hour0, uint16_t* out, int n, float mul) {
+    for (int i = 0; i < n; i++) out[i] = AQ_NONE;
+    if (!cJSON_IsArray(times) || !cJSON_IsArray(values)) return;
+    int cnt = cJSON_GetArraySize(times);
+    for (int i = 0; i < cnt; i++) {
+        cJSON* t = cJSON_GetArrayItem(times, i);
+        if (t == nullptr || !cJSON_IsNumber(t)) continue;
+        int64_t idx = ((int64_t)t->valuedouble - hour0) / 3600;
+        if (idx < 0 || idx >= n) continue;
+        out[idx] = JsonU16(cJSON_GetArrayItem(values, i), mul);
+    }
+}
+
+template <typename Net>
+static bool FetchAir(Net* network) {
+    char url[384];
+    snprintf(url, sizeof(url),
+             "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=%.4f&longitude=%.4f"
+             "&current=european_aqi,pm10,pm2_5,dust,uv_index&hourly=dust,pm10"
+             "&forecast_days=3&timezone=auto&timeformat=unixtime",
+             kWeatherLat, kWeatherLon);
+    cJSON* root = HttpGetJson(network, url, "Air");
+    if (root == nullptr) return false;
+    cJSON* cur = cJSON_GetObjectItem(root, "current");
+    if (cur == nullptr) {
+        cJSON_Delete(root);
+        return false;
+    }
+    AirCache a;
+    memset(&a, 0, sizeof(a));
+    a.aqi = JsonU16(cJSON_GetObjectItem(cur, "european_aqi"), 1.0f);
+    a.pm10_10 = JsonU16(cJSON_GetObjectItem(cur, "pm10"), 10.0f);
+    a.pm25_10 = JsonU16(cJSON_GetObjectItem(cur, "pm2_5"), 10.0f);
+    a.dust = JsonU16(cJSON_GetObjectItem(cur, "dust"), 1.0f);
+    a.uv10 = JsonU16(cJSON_GetObjectItem(cur, "uv_index"), 10.0f);
+    int64_t now = IsTimeValidNow() ? (int64_t)time(nullptr) : 0;
+    cJSON* ct = cJSON_GetObjectItem(cur, "time");
+    if (now == 0 && ct != nullptr && cJSON_IsNumber(ct)) now = (int64_t)ct->valuedouble;
+    a.hour0 = now - now % 3600;
+    cJSON* hourly = cJSON_GetObjectItem(root, "hourly");
+    if (hourly != nullptr) {
+        cJSON* ht = cJSON_GetObjectItem(hourly, "time");
+        FillHourly(ht, cJSON_GetObjectItem(hourly, "dust"), a.hour0, a.dust_next, AQ_HOURS, 1.0f);
+        FillHourly(ht, cJSON_GetObjectItem(hourly, "pm10"), a.hour0, a.pm10_next, AQ_HOURS, 10.0f);
+    } else {
+        for (int i = 0; i < AQ_HOURS; i++) { a.dust_next[i] = AQ_NONE; a.pm10_next[i] = AQ_NONE; }
+    }
+    cJSON_Delete(root);
+    if (a.aqi == AQ_NONE) return false;
+    a.fetched_unix = now;
+    a.magic = kAirMagic;
+    s_air = a;
+    s_air_fetch_ms = esp_timer_get_time() / 1000;
+    ESP_LOGI("Air", "AQI %d, dust %d", a.aqi, a.dust);
+    return true;
+}
+
+template <typename Net>
+static bool FetchSea(Net* network) {
+    char url[384];
+    snprintf(url, sizeof(url),
+             "https://marine-api.open-meteo.com/v1/marine?latitude=%.4f&longitude=%.4f"
+             "&current=wave_height,wave_period,sea_surface_temperature&hourly=wave_height"
+             "&daily=wave_height_max&forecast_days=3&timezone=auto&timeformat=unixtime&cell_selection=sea",
+             kSeaLat, kSeaLon);
+    cJSON* root = HttpGetJson(network, url, "Sea");
+    if (root == nullptr) return false;
+    cJSON* cur = cJSON_GetObjectItem(root, "current");
+    if (cur == nullptr) {
+        cJSON_Delete(root);
+        return false;
+    }
+    SeaCache s;
+    memset(&s, 0, sizeof(s));
+    cJSON* sst = cJSON_GetObjectItem(cur, "sea_surface_temperature");
+    s.sst10 = (sst != nullptr && cJSON_IsNumber(sst)) ? (int16_t)lround(sst->valuedouble * 10.0) : (int16_t)-32768;
+    s.wave_cm = JsonU16(cJSON_GetObjectItem(cur, "wave_height"), 100.0f);
+    s.period10 = JsonU16(cJSON_GetObjectItem(cur, "wave_period"), 10.0f);
+    s.wave_max_cm = AQ_NONE;
+    cJSON* daily = cJSON_GetObjectItem(root, "daily");
+    if (daily != nullptr) {
+        cJSON* mx = cJSON_GetObjectItem(daily, "wave_height_max");
+        if (cJSON_IsArray(mx)) s.wave_max_cm = JsonU16(cJSON_GetArrayItem(mx, 0), 100.0f);
+    }
+    int64_t now = IsTimeValidNow() ? (int64_t)time(nullptr) : 0;
+    cJSON* ct = cJSON_GetObjectItem(cur, "time");
+    if (now == 0 && ct != nullptr && cJSON_IsNumber(ct)) now = (int64_t)ct->valuedouble;
+    s.hour0 = now - now % 3600;
+    cJSON* hourly = cJSON_GetObjectItem(root, "hourly");
+    if (hourly != nullptr) {
+        FillHourly(cJSON_GetObjectItem(hourly, "time"), cJSON_GetObjectItem(hourly, "wave_height"),
+                   s.hour0, s.wave_next_cm, SEA_HOURS, 100.0f);
+    } else {
+        for (int i = 0; i < SEA_HOURS; i++) s.wave_next_cm[i] = AQ_NONE;
+    }
+    cJSON_Delete(root);
+    if (s.sst10 == -32768) return false;
+    s.fetched_unix = now;
+    s.magic = kSeaMagic;
+    s_sea = s;
+    s_sea_fetch_ms = esp_timer_get_time() / 1000;
+    ESP_LOGI("Sea", "water %.1f, waves %d cm", s.sst10 / 10.0f, s.wave_cm);
+    return true;
+}
+
+// Для голоса и виджетов в обычном режиме: из памяти, если свежие.
+static bool GetAir() {
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    bool fresh = s_air.magic == kAirMagic && s_air_fetch_ms != 0 && now_ms - s_air_fetch_ms < kAirCacheTtlMs;
+    if (!fresh) FetchAir(Board::GetInstance().GetNetwork());
+    return s_air.magic == kAirMagic;
+}
+
+static bool GetSea() {
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    bool fresh = s_sea.magic == kSeaMagic && s_sea_fetch_ms != 0 && now_ms - s_sea_fetch_ms < kSeaCacheTtlMs;
+    if (!fresh) FetchSea(Board::GetInstance().GetNetwork());
+    return s_sea.magic == kSeaMagic;
+}
+
+// ===== ОРГАНАЙЗЕР: то, что должно пережить сон =====
+struct OrgRtc {
+    uint32_t magic;
+    bool time_trusted;        // часы хоть раз сверены с интернетом после включения
+    int64_t last_check;       // до какого момента события уже проверены
+    int8_t pending_kind;      // событие, из-за которого вышли из режима часов
+    int8_t pending_index;
+    int64_t pending_at;
+    int64_t snooze_until;     // отложенный будильник (в режиме часов)
+    int8_t snooze_index;
+    int64_t timer_end_unix;   // таймер, который шёл при уходе в режим часов
+    int32_t timer_total_s;
+    char wifi_ssid[33];       // к какой сети был подключён (для QR в режиме часов), без пароля
+    uint8_t wifi_open;        // сеть без пароля
+};
+static constexpr uint32_t kOrgRtcMagic = 0x4F524754;   // "ORGT"
+static RTC_DATA_ATTR OrgRtc s_org;
+
+static void OrgRtcEnsure() {
+    if (s_org.magic == kOrgRtcMagic) return;
+    memset(&s_org, 0, sizeof(s_org));
+    s_org.magic = kOrgRtcMagic;
+    s_org.snooze_index = -1;
+}
+
+// Ночная экономия: в эти часы режим часов обновляет экран реже.
+static bool IsNightHour(int64_t t) {
+    time_t tt = (time_t)t;
+    struct tm tm_l;
+    localtime_r(&tt, &tm_l);
+    if (kNightFromHour < kNightToHour) return tm_l.tm_hour >= kNightFromHour && tm_l.tm_hour < kNightToHour;
+    return tm_l.tm_hour >= kNightFromHour || tm_l.tm_hour < kNightToHour;
+}
+
+// Строка для QR домашнего Wi-Fi: имя из памяти, пароль из сохранённых сетей.
+static void FillWifiQr(DeskScreenData& d) {
+    d.wifi_ssid[0] = 0;
+    d.wifi_qr[0] = 0;
+    if (s_org.magic != kOrgRtcMagic || s_org.wifi_ssid[0] == 0) return;
+    std::string ssid(s_org.wifi_ssid, strnlen(s_org.wifi_ssid, 32));
+    std::string pass;
+    bool known = false;
+    for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+        if (item.ssid == ssid) { pass = item.password; known = true; break; }
+    }
+    if (!known && !s_org.wifi_open) return;   // пароль неизвестен: код был бы бесполезен
+    OrgCopyText(d.wifi_ssid, sizeof(d.wifi_ssid), ssid.c_str());
+    QrWifiString(d.wifi_qr, sizeof(d.wifi_qr), ssid.c_str(), pass.c_str(), s_org.wifi_open != 0);
+}
+
+// Запоминает сеть, к которой сейчас подключены (в обычном режиме).
+static void RememberWifi() {
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;
+    OrgRtcEnsure();
+    char ssid[33];
+    memcpy(ssid, ap.ssid, 32);
+    ssid[32] = 0;
+    if (ssid[0] == 0) return;
+    memcpy(s_org.wifi_ssid, ssid, sizeof(s_org.wifi_ssid));
+    s_org.wifi_open = ap.authmode == WIFI_AUTH_OPEN ? 1 : 0;
+}
+
+// Будильник, напоминание и списки для экранов.
+static void FillOrgData(DeskScreenData& d) {
+    FillWifiQr(d);
+    OrgLoadList(ORG_LIST_SHOP, d.shop);
+    OrgLoadList(ORG_LIST_NOTES, d.notes);
+    d.air = s_air;
+    d.sea = s_sea;
+    int64_t now = (int64_t)time(nullptr);
+    if (!IsTimeValidNow()) return;
+    d.night = IsNightHour(now);
+    OrgSchedule sched;
+    OrgLoadSchedule(sched);
+    int64_t at = 0;
+    int ai = OrgNextAlarmIndex(sched, now, &at);
+    if (ai >= 0) {
+        d.next_alarm_at = at;
+        d.next_alarm_days = sched.alarms[ai].days;
+    }
+    int ri = OrgNextReminderIndex(sched, now, &at);
+    if (ri >= 0) {
+        d.next_rem_at = at;
+        OrgCopyText(d.next_rem_text, sizeof(d.next_rem_text), sched.rem[ri].text);
+    }
+}
+
+// Время события по-английски для ответа ассистенту: "Mon 2026-09-28 07:30".
+static std::string OrgWhen(int64_t t) {
+    time_t tt = (time_t)t;
+    struct tm tm_l;
+    localtime_r(&tt, &tm_l);
+    char buf[40];
+    strftime(buf, sizeof(buf), "%a %Y-%m-%d %H:%M", &tm_l);
+    return buf;
+}
+
 class CustomBoard : public WifiBoard {
   private:
     i2c_master_bus_handle_t   i2c_bus_;
@@ -590,9 +867,6 @@ class CustomBoard : public WifiBoard {
     adc_oneshot_unit_handle_t adc1_handle;
     adc_cali_handle_t         cali_handle;
     esp_timer_handle_t timer_handle_ = nullptr;
-	esp_timer_handle_t alarm_handle_ = nullptr;
-	int alarm_count_ = 0;
-    int saved_volume_ = 0;
     int64_t timer_end_us_ = 0;
     int64_t stopwatch_start_us_ = 0;
     bool stopwatch_running_ = false;
@@ -625,6 +899,7 @@ class CustomBoard : public WifiBoard {
 	//кнопки
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            if (HandleAlertButton(false)) return;   // звонок: отложить / закрыть
             auto &app = Application::GetInstance();
             // During startup (before connected), pressing BOOT button enters Wi-Fi config mode without reboot
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -649,6 +924,7 @@ class CustomBoard : public WifiBoard {
         pwr_button_.OnClick([this]() {
             // Первые секунды после включения нажатия не считаем: это
             // отпускание той самой кнопки, которой устройство включили.
+            if (HandleAlertButton(true)) return;   // звонок: выключить (сразу, даже после пробуждения)
             if (esp_timer_get_time() < 8000000LL) return;
             RequestDeskMode(false);
         });
@@ -723,6 +999,7 @@ class CustomBoard : public WifiBoard {
         if (display_->GetFaceMode() != FaceMode::kIdle) return;
         if (wifi_warn_cooldown_ > 0) return;
 
+        RememberWifi();   // для QR в режиме часов
         wifi_ap_record_t ap;
         if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;
         ESP_LOGI(TAG, "WiFi RSSI: %d", ap.rssi);
@@ -756,7 +1033,8 @@ class CustomBoard : public WifiBoard {
         auto& app = Application::GetInstance();
         int64_t now = esp_timer_get_time();
         bool timer_busy = timer_end_us_ != 0 && now < timer_end_us_ + 60LL * 1000000;   // минута на будильник
-        if (app.GetDeviceState() != kDeviceStateIdle || timer_busy || stopwatch_running_) {
+        bool org_busy = ring_kind_ >= 0 || alert_active_ || !pending_speech_.empty();
+        if (app.GetDeviceState() != kDeviceStateIdle || timer_busy || stopwatch_running_ || org_busy) {
             idle_since_us_ = 0;
             return;
         }
@@ -781,6 +1059,7 @@ class CustomBoard : public WifiBoard {
             self->CheckWifiSignal();
             self->HistoryTick();
             self->AutoDeskTick();
+            self->OrgTick();
         };
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
@@ -883,6 +1162,9 @@ class CustomBoard : public WifiBoard {
                 return DescribePage(DESK_PAGE_BATTERY, *dp);
             });
 
+// будильники, напоминания, списки, QR
+        InitializeOrganizerTools();
+
 // любой экран режима часов по голосу
         mcp_server.AddTool(
             "self.screen.show",
@@ -899,7 +1181,10 @@ class CustomBoard : public WifiBoard {
             "проветрить, открыть окно, где теплее, дома или на улице), "
             "sun (sunrise, sunset, day length, UV index; восход, закат, солнце, ультрафиолет), "
             "moon (moon phase; луна, фаза луны, полнолуние), "
-            "battery (battery chart for the week and days left). "
+            "battery (battery chart for the week and days left), "
+            "air (air quality index, Saharan dust, PM10, PM2.5; качество воздуха, пыль, чем дышим), "
+            "beach (sea water temperature, waves, UV, whether it is good to swim today; море, можно ли "
+            "купаться, волны, температура воды). "
             "For the current weather prefer self.weather.get_current, for the room right now "
             "prefer self.sensor.get_room_climate. "
             "Tell the user the result briefly in their language. "
@@ -910,7 +1195,7 @@ class CustomBoard : public WifiBoard {
                 int page = PageFromName(name);
                 if (page < 0) {
                     return std::string("{\"success\":false,\"error\":\"unknown page, use one of: "
-                                       "clock, forecast, room_history, ventilate, sun, moon, battery\"}");
+                                       "clock, forecast, room_history, ventilate, sun, moon, battery, air, beach\"}");
                 }
                 auto dp = std::make_unique<DeskScreenData>();
                 CollectLiveData(*dp, page);
@@ -942,9 +1227,10 @@ class CustomBoard : public WifiBoard {
 	
 //таймер
 	        mcp_server.AddTool("self.timer.set",
-            "Set a countdown timer. Call when the user asks to set a timer or remind after some time. "
-            "seconds is the total time in seconds (convert minutes and hours to seconds). "
-            "A new timer replaces the previous one. Confirm the time to the user.",
+            "Set a countdown timer (таймер на 10 минут). seconds is the total time in seconds "
+            "(convert minutes and hours to seconds). The countdown is shown in big digits on the screen. "
+            "A new timer replaces the previous one. Confirm the time to the user. "
+            "For reminders with a text use self.reminder.add.",
             PropertyList({Property("seconds", kPropertyTypeInteger, 60, 1, 86400)}),
             [this](const PropertyList &properties) -> ReturnValue {
                 int seconds = properties["seconds"].value<int>();
@@ -952,6 +1238,8 @@ class CustomBoard : public WifiBoard {
                 esp_timer_stop(timer_handle_);
                 esp_timer_start_once(timer_handle_, (int64_t)seconds * 1000000);
                 timer_end_us_ = esp_timer_get_time() + (int64_t)seconds * 1000000;
+                timer_total_s_ = seconds;
+                UpdatePinned();   // обратный отсчёт на экране
                 return std::string("{\"success\":true,\"seconds\":") + std::to_string(seconds) + "}";
             });
 
@@ -961,6 +1249,7 @@ class CustomBoard : public WifiBoard {
             [this](const PropertyList &) -> ReturnValue {
                 if (timer_handle_) esp_timer_stop(timer_handle_);
                 timer_end_us_ = 0;
+                UpdatePinned();
                 return std::string("{\"success\":true}");
             });
 
@@ -1118,6 +1407,9 @@ mcp_server.AddTool(
             ESP_LOGI(TAG, "Auto listen: device ready, saying hello");
             esp_timer_stop(autolisten_timer_);
             StartSntpOnce();
+            // Проснулись из-за будильника или напоминания: вместо "привет"
+            // будет звонок и свой рассказ.
+            if (skip_greeting_ || ring_kind_ >= 0 || alert_active_ || !pending_speech_.empty()) return;
             app.WakeWordInvoke("Привет!!!"); //Говорит после пробуждения
             return;
         }
@@ -1165,6 +1457,11 @@ mcp_server.AddTool(
      { -1, EYES_HAPPY,    MOUTH_SMILE, 1200 },   // привет!
  };
 
+ // Проснулись из-за будильника или напоминания: один кадр "ой!".
+ static constexpr BootStep kEventWake[] = {
+     { -1, EYES_BIG, MOUTH_O, 900 },
+ };
+
  const BootStep* boot_steps_ = kColdBoot;
  int boot_step_count_ = 0;
  int boot_step_left_ms_ = 0;
@@ -1180,7 +1477,10 @@ mcp_server.AddTool(
 
  void ShowBootProgress() {
     display_->SetBooting(true);
-    if (woke_from_desk_) {
+    if (boot_event_.kind != ORG_EV_NONE) {
+        boot_steps_ = kEventWake;   // будильник: сразу к делу
+        boot_step_count_ = sizeof(kEventWake) / sizeof(kEventWake[0]);
+    } else if (woke_from_desk_) {
         boot_steps_ = kWakeUp;
         boot_step_count_ = sizeof(kWakeUp) / sizeof(kWakeUp[0]);
     } else {
@@ -1251,33 +1551,12 @@ mcp_server.AddTool(
         esp_timer_start_periodic(autolisten_timer_, 1000 * 1000);
     }
 
+    // Таймер закончился: звонок и "время вышло" на экране.
     void StartAlarm() {
-        if (!alarm_handle_) {
-            esp_timer_create_args_t args = {};
-            args.callback = [](void *arg) {
-                auto *self = static_cast<CustomBoard *>(arg);
-                Application::GetInstance().Schedule([self]() { self->AlarmTick(); });
-            };
-            args.arg = this;
-            args.name = "alarm_repeat";
-            esp_timer_create(&args, &alarm_handle_);
-        }
-        esp_timer_stop(alarm_handle_);
-        alarm_count_ = 0;
-        auto codec = GetAudioCodec();
-        saved_volume_ = codec->output_volume();
-        codec->SetOutputVolume(100);
-        esp_timer_start_periodic(alarm_handle_, 1000000);
-    }
-
-    void AlarmTick() {
-        if (alarm_count_ >= 5) {
-            esp_timer_stop(alarm_handle_);
-            GetAudioCodec()->SetOutputVolume(saved_volume_);
-            return;
-        }
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_EXCLAMATION);
-        alarm_count_++;
+        OrgEvent e;
+        e.kind = ORG_EV_TIMER;
+        e.at = IsTimeValidNow() ? (int64_t)time(nullptr) : 0;
+        FireEvent(e);
     }
 
     uint16_t BatterygetVoltage(void) {
@@ -1436,17 +1715,69 @@ mcp_server.AddTool(
 
     // Сколько спать до следующего обновления: просыпаемся сразу после
     // смены минуты, чтобы часы на экране не отставали.
+    // Ночью (kNightFromHour..kNightToHour) реже. Но если раньше
+    // будильник, напоминание или таймер, просыпаемся точно к нему.
     int64_t DeskMicrosToNextWake() {
-        const int64_t period = (int64_t)kDeskWakeSec * 1000000;
         struct timeval tv;
         gettimeofday(&tv, nullptr);
         if (tv.tv_sec < 1600000000) {
-            return period;   // времени нет, просто через период
+            return (int64_t)kDeskWakeSec * 1000000;   // времени нет, просто через период
         }
-        int64_t into = (int64_t)(tv.tv_sec % kDeskWakeSec) * 1000000 + tv.tv_usec;
+        int period_s = IsNightHour(tv.tv_sec) ? kNightWakeSec : kDeskWakeSec;
+        const int64_t period = (int64_t)period_s * 1000000;
+        int64_t into = (int64_t)(tv.tv_sec % period_s) * 1000000 + tv.tv_usec;
         int64_t us = period - into + 300000;
         if (us < 300000) us = 300000;
+
+        if (s_org.time_trusted) {
+            OrgSchedule sched;
+            OrgLoadSchedule(sched);
+            OrgEvent e = OrgNextEvent(sched, tv.tv_sec, s_org.timer_end_unix, s_org.snooze_until, s_org.snooze_index);
+            if (e.kind != ORG_EV_NONE) {
+                int64_t ev_us = (e.at - tv.tv_sec) * 1000000 - tv.tv_usec + 300000;
+                if (ev_us < 300000) ev_us = 300000;
+                if (ev_us < us) us = ev_us;
+            }
+        }
         return us;
+    }
+
+    // Режим часов: не пора ли звонить? Если да, запоминаем событие и
+    // выходим в обычный режим (там звонок, экран и голос).
+    bool DeskCheckEvents() {
+        OrgRtcEnsure();
+        if (!s_org.time_trusted || !IsTimeValidNow()) return false;
+        int64_t now = (int64_t)time(nullptr);
+        int64_t from = s_org.last_check;
+        if (from <= 0 || from > now || now - from > 36LL * 3600) from = now - 90;
+        OrgSchedule sched;
+        OrgLoadSchedule(sched);
+        OrgEvent e = OrgFindDue(sched, from, now + 2, s_org.timer_end_unix, s_org.snooze_until, s_org.snooze_index);
+        if (e.kind == ORG_EV_NONE) {
+            s_org.last_check = now;
+            return false;
+        }
+        ESP_LOGI(TAG, "Desk: event kind=%d, waking up", e.kind);
+        s_org.pending_kind = (int8_t)e.kind;
+        s_org.pending_index = (int8_t)e.index;
+        s_org.pending_at = e.at;
+        s_org.last_check = e.at;
+        if (e.kind == ORG_EV_TIMER) s_org.timer_end_unix = 0;
+        if (e.kind == ORG_EV_SNOOZE) s_org.snooze_until = 0;
+        return true;
+    }
+
+    // Страницы, которые при листании пропускаем: пустые списки и нет данных.
+    bool DeskPageEmpty(int page) {
+        if (page == DESK_PAGE_SHOP || page == DESK_PAGE_NOTES) {
+            OrgList l;
+            OrgLoadList(page == DESK_PAGE_SHOP ? ORG_LIST_SHOP : ORG_LIST_NOTES, l);
+            return l.count == 0;
+        }
+        if (page == DESK_PAGE_AIR) return s_air.magic != kAirMagic;
+        if (page == DESK_PAGE_BEACH) return s_sea.magic != kSeaMagic;
+        if (page == DESK_PAGE_WIFI) return s_org.magic != kOrgRtcMagic || s_org.wifi_ssid[0] == 0;
+        return false;
     }
 
     // Засыпание. with_timer = false: спим до нажатия PWR, без будильника
@@ -1530,6 +1861,7 @@ mcp_server.AddTool(
         d.battery = (int)BatterygetPercent();
         HistRecord(d.room_ok, d.room_t, d.room_h, d.battery);
         FillChartData(d);
+        FillOrgData(d);
     }
 
     // ===== Виджеты во время разговора =====
@@ -1544,6 +1876,10 @@ mcp_server.AddTool(
             { "room_history", DESK_PAGE_ROOM24 }, { "ventilate", DESK_PAGE_BOTH },
             { "sun", DESK_PAGE_SUN },           { "moon", DESK_PAGE_MOON },
             { "battery", DESK_PAGE_BATTERY },
+            { "air", DESK_PAGE_AIR },           { "dust", DESK_PAGE_AIR },
+            { "air_quality", DESK_PAGE_AIR },   { "beach", DESK_PAGE_BEACH },
+            { "sea", DESK_PAGE_BEACH },         { "swim", DESK_PAGE_BEACH },
+            { "shopping", DESK_PAGE_SHOP },     { "notes", DESK_PAGE_NOTES },
         };
         for (auto& n : kNames) {
             if (name == n.name) return n.page;
@@ -1561,6 +1897,12 @@ mcp_server.AddTool(
         } else if (s_weather_cache.valid) {
             d.weather = s_weather_cache;
         }
+        if (page == DESK_PAGE_AIR) GetAir();
+        if (page == DESK_PAGE_BEACH) {
+            GetSea();
+            WeatherCache w;
+            if (GetWeather(w)) d.weather = w;   // воздух и УФ для пляжа
+        }
         float t = 0, h = 0;
         d.room_ok = ReadSHTC3(t, h);
         d.room_t = t;
@@ -1568,6 +1910,7 @@ mcp_server.AddTool(
         d.battery = (int)BatterygetPercent();
         HistRecord(d.room_ok, d.room_t, d.room_h, d.battery);
         FillChartData(d);
+        FillOrgData(d);
         if (d.now == 0) d.now = (int64_t)time(nullptr);
     }
 
@@ -1685,6 +2028,41 @@ mcp_server.AddTool(
                     name, illum, to_full, to_new);
                 return buf;
             }
+            case DESK_PAGE_AIR: {
+                const AirCache& a = d.air;
+                if (a.magic != kAirMagic || a.aqi == AQ_NONE) return "{\"success\":false,\"error\":\"no air quality data\"}";
+                static const char* const kLevels[6] = { "very good", "good", "moderate", "poor", "very poor", "extremely poor" };
+                int lvl = AqiLevel(a.aqi);
+                int dust_max = -1;
+                int shift = a.hour0 > 0 && d.now > a.hour0 ? (int)((d.now - a.hour0) / 3600) : 0;
+                for (int i = shift; i < shift + 24 && i < AQ_HOURS; i++) {
+                    if (a.dust_next[i] != AQ_NONE && (int)a.dust_next[i] > dust_max) dust_max = a.dust_next[i];
+                }
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"european_aqi\":%d,\"level\":\"%s\",\"dust_ugm3\":%d,"
+                    "\"pm10_ugm3\":%.0f,\"pm2_5_ugm3\":%.0f,\"dust_max_next24h\":%d}",
+                    a.aqi, lvl >= 0 ? kLevels[lvl] : "unknown", a.dust == AQ_NONE ? 0 : a.dust,
+                    a.pm10_10 == AQ_NONE ? 0.0f : a.pm10_10 / 10.0f, a.pm25_10 == AQ_NONE ? 0.0f : a.pm25_10 / 10.0f,
+                    dust_max < 0 ? 0 : dust_max);
+                return buf;
+            }
+            case DESK_PAGE_BEACH: {
+                const SeaCache& sc = d.sea;
+                if (sc.magic != kSeaMagic || sc.sst10 == -32768) return "{\"success\":false,\"error\":\"no sea data\"}";
+                int v = SeaVerdict(sc);
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"water_c\":%.1f,\"waves_m\":%.1f,\"waves_max_today_m\":%.1f,"
+                    "\"uv_index_max\":%.0f,\"air_c\":%.0f,\"swim_verdict\":\"%s\"}",
+                    sc.sst10 / 10.0f, sc.wave_cm == AQ_NONE ? 0.0f : sc.wave_cm / 100.0f,
+                    sc.wave_max_cm == AQ_NONE ? 0.0f : sc.wave_max_cm / 100.0f,
+                    d.uv_max < 0 ? 0.0f : d.uv_max, d.weather.valid ? d.weather.temperature : 0.0f,
+                    v == 2 ? "great" : (v == 1 ? "ok, a bit cool or wavy" : "not recommended"));
+                return buf;
+            }
+            case DESK_PAGE_SHOP:
+                return std::string("{\"success\":true,\"items\":") + OrgListJson(d.shop) + "}";
+            case DESK_PAGE_NOTES:
+                return std::string("{\"success\":true,\"items\":") + OrgListJson(d.notes) + "}";
             case DESK_PAGE_BATTERY:
                 if (d.batt_days_left >= 0) {
                     snprintf(buf, sizeof(buf), "{\"percent\":%d,\"days_left_estimate\":%d}",
@@ -1770,6 +2148,8 @@ mcp_server.AddTool(
             esp_netif_sntp_init(&sntp_cfg);
             if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(8000)) == ESP_OK) {
                 s_sntp_synced = true;
+                OrgRtcEnsure();
+                s_org.time_trusted = true;
                 ESP_LOGI(TAG, "Desk: time synced");
             } else {
                 ESP_LOGW(TAG, "Desk: time sync failed");
@@ -1780,6 +2160,8 @@ mcp_server.AddTool(
                 s_desk.weather = WeatherToRtc(s_weather_cache);
                 ESP_LOGI(TAG, "Desk: weather updated");
             }
+            FetchAir(WifiBoard::GetNetwork());
+            FetchSea(WifiBoard::GetNetwork());
             // время могло сильно поменяться после синхронизации
             s_desk.last_sync = time(nullptr);
         }
@@ -1825,7 +2207,18 @@ mcp_server.AddTool(
         }
 
         if (by_boot) {
-            s_desk.page = (s_desk.page + 1) % DESK_PAGE_COUNT;
+            int page = s_desk.page;
+            for (int tries = 0; tries < DESK_PAGE_COUNT; tries++) {
+                page = (page + 1) % DESK_PAGE_COUNT;
+                if (!DeskPageEmpty(page)) break;
+            }
+            s_desk.page = (uint8_t)page;
+        }
+
+        // Пора звонить (будильник, напоминание, таймер)? Тогда в обычный режим.
+        if (DeskCheckEvents()) {
+            s_desk.active = false;
+            return;
         }
 
         InitializeI2c();
@@ -1887,6 +2280,29 @@ mcp_server.AddTool(
 
         ESP_LOGI(TAG, "Entering desk mode");
 
+        // Таймер и отложенный будильник дотикают в режиме часов.
+        OrgRtcEnsure();
+        RememberWifi();
+        {
+            int64_t now_us = esp_timer_get_time();
+            int64_t now = (int64_t)time(nullptr);
+            bool t_ok = IsTimeValidNow();
+            s_org.timer_end_unix = (t_ok && TimerRunning()) ? now + (timer_end_us_ - now_us) / 1000000 : 0;
+            s_org.timer_total_s = timer_total_s_;
+            s_org.snooze_until = (t_ok && snooze_due_us_ > now_us) ? now + (snooze_due_us_ - now_us) / 1000000 : 0;
+            s_org.snooze_index = (int8_t)snooze_index_;
+            if (t_ok) s_org.last_check = now;
+            if (timer_handle_) esp_timer_stop(timer_handle_);
+            StopRing();
+            alert_active_ = false;
+            // Список был на экране: пусть и в режиме часов остаётся он.
+            if (user_pin_ == PIN_LIST) {
+                desk_start_page_ = user_list_id_ == ORG_LIST_NOTES ? DESK_PAGE_NOTES : DESK_PAGE_SHOP;
+            }
+            user_pin_ = PIN_NONE;
+            display_->ClearPinned();
+        }
+
         // Останавливаем всё, что может рисовать лица.
         if (led_timer_) esp_timer_stop(led_timer_);
         if (boot_timer_) esp_timer_stop(boot_timer_);
@@ -1912,12 +2328,17 @@ mcp_server.AddTool(
         d.room_h = h;
         d.battery = (int)BatterygetPercent();
         HistRecord(d.room_ok, d.room_t, d.room_h, d.battery);
+        // Сеть сейчас есть: заодно свежие воздух и море, если старые.
+        int64_t now_u = (int64_t)time(nullptr);
+        if (s_air.magic != kAirMagic || now_u - s_air.fetched_unix > 3600) FetchAir(WifiBoard::GetNetwork());
+        if (s_sea.magic != kSeaMagic || now_u - s_sea.fetched_unix > 3 * 3600) FetchSea(WifiBoard::GetNetwork());
         FillChartData(d);
+        FillOrgData(d);
 
         memset(&s_desk, 0, sizeof(s_desk));
         s_desk.magic = kDeskMagic;
         s_desk.active = true;
-        s_desk.page = DESK_PAGE_CLOCK;
+        s_desk.page = (uint8_t)desk_start_page_;
         s_desk.weather = WeatherToRtc(d.weather);
         // Если точное время из интернета и погода уже есть, в сеть пойдём через сутки,
         // иначе при первом же пробуждении (заодно исправится неверное время).
@@ -1926,7 +2347,7 @@ mcp_server.AddTool(
         power_->PowerAudioOff();
         power_->LedOff();
 
-        display_->RenderDeskPage(DESK_PAGE_CLOCK, d, nullptr, true);   // полное обновление
+        display_->RenderDeskPage(desk_start_page_, d, nullptr, true);   // полное обновление
         DeskSaveFrame(true);
         display_->EPD_Sleep();
 
@@ -1944,6 +2365,696 @@ mcp_server.AddTool(
         esp_netif_sntp_init(&cfg);
     }
 
+    // =====================================================================
+    // ======================== ОРГАНАЙЗЕР В РАБОТЕ ========================
+    // =====================================================================
+    // Раз в секунду (из таймера светодиода): проверить будильники и
+    // напоминания, вести звонок, показать нужный закреплённый экран.
+
+    std::mutex org_mutex_;                 // расписание меняют голосовые команды и таймер
+    OrgSchedule org_sched_;
+    bool org_loaded_ = false;
+    int64_t org_last_tick_us_ = 0;
+    int64_t audio_ready_us_ = 0;           // когда запустился звук (0 = ещё нет)
+
+    // звонок
+    int ring_kind_ = -1;                   // -1 нет, иначе ALERT_ALARM / ALERT_REMINDER / ALERT_TIMER
+    int ring_alarm_index_ = -1;
+    int64_t ring_started_us_ = 0;          // 0: ждём, пока будет готов звук
+    int ring_count_ = 0;
+    int ring_saved_volume_ = -1;
+
+    // оповещение на экране и закреплённые экраны
+    PinnedScreen* alert_pin_ = nullptr;
+    bool alert_active_ = false;
+    int64_t alert_until_us_ = 0;
+    PinnedScreen* scratch_pin_ = nullptr;
+    PinnedScreen* qr_pin_ = nullptr;
+    int user_pin_ = PIN_NONE;              // что попросили показать: список или QR
+    int user_list_id_ = ORG_LIST_SHOP;
+    int64_t user_pin_until_us_ = 0;        // для QR: когда убрать самому
+    volatile bool pin_dirty_ = false;      // экран ещё не принял заявку, повторить
+    std::mutex pin_mutex_;
+
+    // таймер, отложенный будильник, что сказать
+    int timer_total_s_ = 0;
+    int64_t snooze_due_us_ = 0;
+    int snooze_index_ = -1;
+    std::string pending_speech_;
+    int64_t pending_speech_deadline_us_ = 0;
+    OrgEvent boot_event_;                  // событие, из-за которого вышли из режима часов
+    bool skip_greeting_ = false;           // не говорить "Привет" при запуске
+    bool timer_was_running_ = false;
+    int desk_start_page_ = DESK_PAGE_CLOCK;   // с какой страницы начать режим часов
+
+    bool TimerRunning() {
+        return timer_end_us_ != 0 && timer_end_us_ > esp_timer_get_time();
+    }
+
+    void OrgEnsureLoaded() {
+        std::lock_guard<std::mutex> lock(org_mutex_);
+        if (!org_loaded_) {
+            OrgLoadSchedule(org_sched_);
+            org_loaded_ = true;
+        }
+    }
+
+    // Показывает на экране самое важное: звонок, потом список или QR, потом таймер.
+    void UpdatePinned() {
+        if (display_ == nullptr) return;
+        std::lock_guard<std::mutex> lock(pin_mutex_);
+        if (scratch_pin_ == nullptr) scratch_pin_ = new PinnedScreen();
+        bool ok = true;
+        if (alert_active_ && alert_pin_ != nullptr) {
+            ok = display_->SetPinned(*alert_pin_);
+        } else if (user_pin_ == PIN_LIST) {
+            PinnedScreen& p = *scratch_pin_;
+            p.kind = PIN_LIST;
+            p.list_id = user_list_id_;
+            OrgLoadList(user_list_id_, p.list);
+            ok = display_->SetPinned(p);
+        } else if (user_pin_ == PIN_QR && qr_pin_ != nullptr) {
+            ok = display_->SetPinned(*qr_pin_);
+        } else if (TimerRunning()) {
+            PinnedScreen& p = *scratch_pin_;
+            p.kind = PIN_TIMER;
+            p.timer_end_us = timer_end_us_;
+            p.timer_total_s = timer_total_s_;
+            ok = display_->SetPinned(p);
+        } else {
+            display_->ClearPinned();
+        }
+        pin_dirty_ = !ok;
+    }
+
+    bool AudioReady() {
+        return audio_ready_us_ != 0 && esp_timer_get_time() - audio_ready_us_ > 1500000;
+    }
+
+    void ShowAlert(int kind, int64_t at, const char* text, int show_sec) {
+        {
+            std::lock_guard<std::mutex> lock(pin_mutex_);
+            if (alert_pin_ == nullptr) alert_pin_ = new PinnedScreen();
+            alert_pin_->kind = PIN_ALERT;
+            alert_pin_->alert_kind = kind;
+            alert_pin_->alert_at = at;
+            OrgCopyText(alert_pin_->alert_text, sizeof(alert_pin_->alert_text), text ? text : "");
+            alert_active_ = true;
+            alert_until_us_ = esp_timer_get_time() + (int64_t)show_sec * 1000000;
+        }
+        UpdatePinned();
+    }
+
+    void ClearAlert() {
+        alert_active_ = false;
+        UpdatePinned();
+    }
+
+    void StartRing(int kind, int alarm_index) {
+        ring_kind_ = kind;
+        ring_alarm_index_ = alarm_index;
+        ring_started_us_ = 0;   // начнём, когда звук готов
+        ring_count_ = 0;
+    }
+
+    void StopRing() {
+        if (ring_kind_ < 0) return;
+        ring_kind_ = -1;
+        if (ring_saved_volume_ >= 0) {
+            GetAudioCodec()->SetOutputVolume(ring_saved_volume_);
+            ring_saved_volume_ = -1;
+        }
+    }
+
+    // Звонок: будильник до kAlarmRingSec, таймер 5 сигналов, напоминание 3.
+    void RingTick() {
+        if (ring_kind_ < 0 || !AudioReady()) return;
+        auto& app = Application::GetInstance();
+        int64_t now = esp_timer_get_time();
+        if (ring_started_us_ == 0) {
+            ring_started_us_ = now;
+            if (ring_kind_ == ALERT_ALARM) {
+                auto codec = GetAudioCodec();
+                ring_saved_volume_ = codec->output_volume();
+                codec->SetOutputVolume(kAlarmVolume);
+            }
+        }
+        if (ring_kind_ == ALERT_ALARM) {
+            if (now - ring_started_us_ >= (int64_t)kAlarmRingSec * 1000000) {
+                // никто не нажал: замолкаем, картинку убираем
+                StopRing();
+                ClearAlert();
+                return;
+            }
+            if (ring_count_ % 2 == 0) {
+                app.PlaySound((ring_count_ / 2) % 2 == 0 ? Lang::Sounds::OGG_VIBRATION : Lang::Sounds::OGG_EXCLAMATION);
+            }
+            ring_count_++;
+            return;
+        }
+        int beeps = ring_kind_ == ALERT_TIMER ? 5 : 3;
+        if (ring_count_ >= beeps) {
+            StopRing();
+            return;
+        }
+        app.PlaySound(ring_kind_ == ALERT_TIMER ? Lang::Sounds::OGG_EXCLAMATION : Lang::Sounds::OGG_POPUP);
+        ring_count_++;
+    }
+
+    static std::string DaysLabelRu(int days) {
+        if (days == 0) return "Будильник";
+        return "Будильник " + OrgDaysShortRu(days);
+    }
+
+    // Сработало событие: звонок, картинка, что сказать.
+    void FireEvent(const OrgEvent& e) {
+        ESP_LOGI(TAG, "Organizer event: kind=%d index=%d", e.kind, e.index);
+        auto& app = Application::GetInstance();
+        if (e.kind == ORG_EV_ALARM || e.kind == ORG_EV_SNOOZE) {
+            int days = 0;
+            {
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (e.index >= 0 && e.index < ORG_MAX_ALARMS && org_sched_.alarms[e.index].used) {
+                    days = org_sched_.alarms[e.index].days;
+                    if (e.kind == ORG_EV_ALARM && days == 0) {   // одноразовый: больше не нужен
+                        org_sched_.alarms[e.index].used = 0;
+                        OrgSaveSchedule(org_sched_);
+                    }
+                }
+            }
+            // разговор прерываем, сейчас важнее разбудить
+            auto st = app.GetDeviceState();
+            if (st == kDeviceStateListening || st == kDeviceStateSpeaking) app.ToggleChatState();
+            std::string label = e.kind == ORG_EV_SNOOZE ? std::string("Ещё раз, вставай!") : DaysLabelRu(days);
+            ShowAlert(ALERT_ALARM, e.at, label.c_str(), kAlarmRingSec + 5);
+            StartRing(ALERT_ALARM, e.index);
+            return;
+        }
+        if (e.kind == ORG_EV_REMINDER) {
+            char text[ORG_REM_TEXT] = "";
+            {
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (e.index >= 0 && e.index < ORG_MAX_REMINDERS && org_sched_.rem[e.index].used) {
+                    OrgCopyText(text, sizeof(text), org_sched_.rem[e.index].text);
+                    org_sched_.rem[e.index].used = 0;
+                    OrgSaveSchedule(org_sched_);
+                }
+            }
+            ShowAlert(ALERT_REMINDER, e.at, text, kReminderShowMin * 60);
+            StartRing(ALERT_REMINDER, -1);
+            time_t at = (time_t)e.at;
+            struct tm tm_a;
+            localtime_r(&at, &tm_a);
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "Сработало напоминание, которое я просил поставить на %d:%02d. "
+                     "Коротко напомни мне о нём вслух: %s", tm_a.tm_hour, tm_a.tm_min, text);
+            QueueSpeech(buf);
+            return;
+        }
+        if (e.kind == ORG_EV_TIMER) {
+            ShowAlert(ALERT_TIMER, e.at, "", kTimerDoneShowSec);
+            StartRing(ALERT_TIMER, -1);
+        }
+    }
+
+    void QueueSpeech(const std::string& text) {
+        pending_speech_ = text;
+        pending_speech_deadline_us_ = esp_timer_get_time() + 180LL * 1000000;
+    }
+
+    // Утренний рассказ после будильника.
+    void QueueBriefing() {
+        static const char* const kWd[7] = { "воскресенье", "понедельник", "вторник", "среда",
+                                            "четверг", "пятница", "суббота" };
+        static const char* const kMon[12] = { "января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+                                              "августа", "сентября", "октября", "ноября", "декабря" };
+        time_t now = time(nullptr);
+        struct tm tm_n;
+        localtime_r(&now, &tm_n);
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+                 "Доброе утро! Я только что выключил будильник. Сегодня %s, %d %s. "
+                 "Расскажи бодро и коротко, примерно за полминуты: какая сегодня погода в Лимассоле "
+                 "(узнай через инструмент погоды), один интересный факт или событие, связанное с этой "
+                 "датой в истории или календаре, и что-нибудь забавное для хорошего настроения.",
+                 kWd[tm_n.tm_wday], tm_n.tm_mday, kMon[tm_n.tm_mon]);
+        QueueSpeech(buf);
+    }
+
+    // Кнопка во время звонка или оповещения. true: нажатие обработано.
+    bool HandleAlertButton(bool pwr) {
+        if (ring_kind_ == ALERT_ALARM || (alert_active_ && alert_pin_ && alert_pin_->alert_kind == ALERT_ALARM)) {
+            int idx = ring_alarm_index_;
+            StopRing();
+            ClearAlert();
+            if (pwr) {
+                QueueBriefing();
+            } else {
+                // отложить
+                snooze_due_us_ = esp_timer_get_time() + (int64_t)kAlarmSnoozeMin * 60 * 1000000;
+                snooze_index_ = idx;
+                Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+            }
+            return true;
+        }
+        if (alert_active_) {
+            StopRing();
+            ClearAlert();
+            return true;
+        }
+        return false;
+    }
+
+    void OrgTick() {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - org_last_tick_us_ < 1000000) return;
+        org_last_tick_us_ = now_us;
+        auto& app = Application::GetInstance();
+
+        if (s_sntp_synced) s_org.time_trusted = true;
+        OrgEnsureLoaded();
+
+        // событие, из-за которого проснулись
+        if (boot_event_.kind != ORG_EV_NONE) {
+            OrgEvent e = boot_event_;
+            boot_event_.kind = ORG_EV_NONE;
+            FireEvent(e);
+        }
+
+        if (pin_dirty_) UpdatePinned();
+        RingTick();
+
+        // картинка оповещения повисела достаточно
+        if (alert_active_ && ring_kind_ < 0 && now_us > alert_until_us_) ClearAlert();
+        // QR с паролем сам уходит
+        if (user_pin_ == PIN_QR && user_pin_until_us_ != 0 && now_us > user_pin_until_us_) {
+            user_pin_ = PIN_NONE;
+            UpdatePinned();
+        }
+        // таймер закончился и экран отсчёта больше не нужен
+        bool running = TimerRunning();
+        if (timer_was_running_ && !running) UpdatePinned();
+        timer_was_running_ = running;
+
+        // отложенный будильник
+        if (snooze_due_us_ != 0 && now_us >= snooze_due_us_) {
+            snooze_due_us_ = 0;
+            OrgEvent e;
+            e.kind = ORG_EV_SNOOZE;
+            e.index = snooze_index_;
+            e.at = IsTimeValidNow() ? (int64_t)time(nullptr) : 0;
+            FireEvent(e);
+        }
+
+        // сказать, что накопилось (рассказ после будильника, напоминание)
+        if (!pending_speech_.empty()) {
+            if (now_us > pending_speech_deadline_us_) {
+                pending_speech_.clear();
+            } else if (AudioReady() && ring_kind_ < 0 && app.GetDeviceState() == kDeviceStateIdle) {
+                std::string text = pending_speech_;
+                pending_speech_.clear();
+                app.WakeWordInvoke(text);
+            }
+        }
+
+        // будильники и напоминания по часам: только когда время проверено интернетом
+        if (!s_sntp_synced) return;
+        int64_t now = (int64_t)time(nullptr);
+        if (s_org.last_check == 0 || now < s_org.last_check || now - s_org.last_check > 15 * 60) {
+            s_org.last_check = now;   // время прыгнуло или только включились: прошлое не звоним
+            return;
+        }
+        OrgEvent e;
+        {
+            std::lock_guard<std::mutex> lock(org_mutex_);
+            e = OrgFindDue(org_sched_, s_org.last_check, now, 0, 0, -1);
+        }
+        if (e.kind != ORG_EV_NONE) {
+            s_org.last_check = e.at;   // следующее событие проверим на следующем шаге
+            FireEvent(e);
+        } else {
+            s_org.last_check = now;
+        }
+    }
+
+    // ===== голосовые команды органайзера =====
+
+    static int ListIdFromName(const std::string& name) {
+        std::string n = OrgLower(name.c_str());
+        if (n == "notes" || n == "note" || n == "заметки") return ORG_LIST_NOTES;
+        return ORG_LIST_SHOP;
+    }
+
+    // Показать список на экране (после любых изменений тоже).
+    void PinList(int list_id) {
+        user_pin_ = PIN_LIST;
+        user_list_id_ = list_id;
+        user_pin_until_us_ = 0;
+        UpdatePinned();
+    }
+
+    void InitializeOrganizerTools() {
+        auto& mcp = McpServer::GetInstance();
+
+        // ---- будильники ----
+        mcp.AddTool("self.alarm.add",
+            "Set an alarm clock (будильник, разбуди меня). hour 0-23, minute 0-59. "
+            "days: once (the next time this clock time comes), daily, weekdays, weekends, "
+            "or a list like mon,wed,fri. The alarm rings even when the device is in the desk clock "
+            "(sleep) mode. When the user turns it off with the PWR button, you will be asked to tell "
+            "the weather, a fact about the day and something funny. Confirm the time and the days. "
+            "For a one-time reminder with a text use self.reminder.add instead.",
+            PropertyList({
+                Property("hour", kPropertyTypeInteger, -1, -1, 23),
+                Property("minute", kPropertyTypeInteger, 0, 0, 59),
+                Property("days", kPropertyTypeString, std::string("once")),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int hour = props["hour"].value<int>();
+                int minute = props["minute"].value<int>();
+                if (hour < 0) return std::string("{\"success\":false,\"error\":\"hour is required\"}");
+                int days = OrgParseDays(props["days"].value<std::string>().c_str());
+                if (days < 0) return std::string("{\"success\":false,\"error\":\"days not understood, use once, daily, weekdays, weekends or mon,tue,...\"}");
+                if (!IsTimeValidNow()) return std::string("{\"success\":false,\"error\":\"the device does not know the time yet, try in a minute\"}");
+                int64_t now = (int64_t)time(nullptr);
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (!org_loaded_) { OrgLoadSchedule(org_sched_); org_loaded_ = true; }
+                int slot = -1;
+                for (int i = 0; i < ORG_MAX_ALARMS; i++) {
+                    OrgAlarm& a = org_sched_.alarms[i];
+                    if (a.used && a.hour == hour && a.minute == minute && a.days == days && days != 0) { slot = i; break; }
+                }
+                if (slot < 0) {
+                    for (int i = 0; i < ORG_MAX_ALARMS; i++) if (!org_sched_.alarms[i].used) { slot = i; break; }
+                }
+                if (slot < 0) return std::string("{\"success\":false,\"error\":\"too many alarms, remove one first\"}");
+                OrgAlarm& a = org_sched_.alarms[slot];
+                a.used = 1;
+                a.hour = (uint8_t)hour;
+                a.minute = (uint8_t)minute;
+                a.days = (uint8_t)days;
+                a.once_at = days == 0 ? OrgNextClock(now, hour, minute) : 0;
+                OrgSaveSchedule(org_sched_);
+                char buf[200];
+                snprintf(buf, sizeof(buf), "{\"success\":true,\"id\":%d,\"time\":\"%02d:%02d\",\"days\":\"%s\",\"next_ring\":\"%s\"}",
+                         slot + 1, hour, minute, OrgDaysText(days).c_str(), OrgWhen(OrgAlarmNext(a, now)).c_str());
+                return std::string(buf);
+            });
+
+        mcp.AddTool("self.alarm.list",
+            "List the alarm clocks (какие будильники стоят). Returns id, time, days and the next ring.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                int64_t now = (int64_t)time(nullptr);
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (!org_loaded_) { OrgLoadSchedule(org_sched_); org_loaded_ = true; }
+                std::string s = "{\"alarms\":[";
+                bool first = true;
+                for (int i = 0; i < ORG_MAX_ALARMS; i++) {
+                    const OrgAlarm& a = org_sched_.alarms[i];
+                    if (!a.used) continue;
+                    int64_t next = OrgAlarmNext(a, now);
+                    if (next == 0) continue;
+                    char buf[160];
+                    snprintf(buf, sizeof(buf), "%s{\"id\":%d,\"time\":\"%02d:%02d\",\"days\":\"%s\",\"next_ring\":\"%s\"}",
+                             first ? "" : ",", i + 1, a.hour, a.minute, OrgDaysText(a.days).c_str(), OrgWhen(next).c_str());
+                    s += buf;
+                    first = false;
+                }
+                s += "]}";
+                return s;
+            });
+
+        mcp.AddTool("self.alarm.remove",
+            "Remove an alarm clock by its id from self.alarm.list (отмени будильник). id 0 removes all alarms. "
+            "To change an alarm, remove it and add a new one.",
+            PropertyList({ Property("id", kPropertyTypeInteger, -1, -1, ORG_MAX_ALARMS) }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int id = props["id"].value<int>();
+                if (id < 0) return std::string("{\"success\":false,\"error\":\"id is required, 0 for all\"}");
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (!org_loaded_) { OrgLoadSchedule(org_sched_); org_loaded_ = true; }
+                int removed = 0;
+                for (int i = 0; i < ORG_MAX_ALARMS; i++) {
+                    if ((id == 0 || id == i + 1) && org_sched_.alarms[i].used) {
+                        org_sched_.alarms[i].used = 0;
+                        removed++;
+                    }
+                }
+                if (id == 0) snooze_due_us_ = 0;
+                OrgSaveSchedule(org_sched_);
+                return std::string("{\"success\":") + (removed ? "true" : "false") + ",\"removed\":" + std::to_string(removed) + "}";
+            });
+
+        // ---- напоминания ----
+        mcp.AddTool("self.reminder.add",
+            "Set a one-time reminder with a text (напомни в 18:00 позвонить маме, напомни через час...). "
+            "Either give hour and minute (optionally date YYYY-MM-DD; without a date it is the next time "
+            "this clock time comes), or in_minutes for a relative time. The device rings, shows the text "
+            "on the screen and you will be asked to say it, even if it was in the desk clock mode. "
+            "Confirm the time.",
+            PropertyList({
+                Property("text", kPropertyTypeString),
+                Property("hour", kPropertyTypeInteger, -1, -1, 23),
+                Property("minute", kPropertyTypeInteger, 0, 0, 59),
+                Property("date", kPropertyTypeString, std::string("")),
+                Property("in_minutes", kPropertyTypeInteger, 0, 0, 10080),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                if (!IsTimeValidNow()) return std::string("{\"success\":false,\"error\":\"the device does not know the time yet\"}");
+                std::string text = props["text"].value<std::string>();
+                int hour = props["hour"].value<int>();
+                int minute = props["minute"].value<int>();
+                std::string date = props["date"].value<std::string>();
+                int in_min = props["in_minutes"].value<int>();
+                int64_t now = (int64_t)time(nullptr);
+                int64_t at = 0;
+                if (in_min > 0) {
+                    at = now + (int64_t)in_min * 60;
+                } else if (hour >= 0) {
+                    int y, mo, d;
+                    if (!date.empty() && sscanf(date.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+                        struct tm tm_d = {};
+                        tm_d.tm_year = y - 1900;
+                        tm_d.tm_mon = mo - 1;
+                        tm_d.tm_mday = d;
+                        tm_d.tm_hour = hour;
+                        tm_d.tm_min = minute;
+                        tm_d.tm_isdst = -1;
+                        at = (int64_t)mktime(&tm_d);
+                    } else {
+                        at = OrgNextClock(now, hour, minute);
+                    }
+                } else {
+                    return std::string("{\"success\":false,\"error\":\"give hour and minute or in_minutes\"}");
+                }
+                if (at <= now) return std::string("{\"success\":false,\"error\":\"this time has already passed\"}");
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (!org_loaded_) { OrgLoadSchedule(org_sched_); org_loaded_ = true; }
+                int slot = -1;
+                for (int i = 0; i < ORG_MAX_REMINDERS; i++) if (!org_sched_.rem[i].used) { slot = i; break; }
+                if (slot < 0) return std::string("{\"success\":false,\"error\":\"too many reminders, remove one first\"}");
+                OrgReminder& r = org_sched_.rem[slot];
+                r.used = 1;
+                r.at = at;
+                OrgCopyText(r.text, sizeof(r.text), text.c_str());
+                OrgSaveSchedule(org_sched_);
+                return std::string("{\"success\":true,\"id\":") + std::to_string(slot + 1) +
+                       ",\"when\":\"" + OrgWhen(at) + "\"}";
+            });
+
+        mcp.AddTool("self.reminder.list",
+            "List the reminders (какие напоминания). Returns id, time and text.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (!org_loaded_) { OrgLoadSchedule(org_sched_); org_loaded_ = true; }
+                std::string s = "{\"reminders\":[";
+                bool first = true;
+                for (int i = 0; i < ORG_MAX_REMINDERS; i++) {
+                    const OrgReminder& r = org_sched_.rem[i];
+                    if (!r.used) continue;
+                    OrgList tmp;
+                    memset(&tmp, 0, sizeof(tmp));
+                    memcpy(tmp.items[0], r.text, sizeof(tmp.items[0]) - 1);
+                    tmp.count = 1;
+                    std::string text_json = OrgListJson(tmp);   // экранирование кавычек
+                    s += std::string(first ? "" : ",") + "{\"id\":" + std::to_string(i + 1) + ",\"when\":\"" +
+                         OrgWhen(r.at) + "\",\"text\":" + text_json.substr(1, text_json.size() - 2) + "}";
+                    first = false;
+                }
+                s += "]}";
+                return s;
+            });
+
+        mcp.AddTool("self.reminder.remove",
+            "Remove a reminder by id from self.reminder.list. id 0 removes all reminders.",
+            PropertyList({ Property("id", kPropertyTypeInteger, -1, -1, ORG_MAX_REMINDERS) }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int id = props["id"].value<int>();
+                if (id < 0) return std::string("{\"success\":false,\"error\":\"id is required, 0 for all\"}");
+                std::lock_guard<std::mutex> lock(org_mutex_);
+                if (!org_loaded_) { OrgLoadSchedule(org_sched_); org_loaded_ = true; }
+                int removed = 0;
+                for (int i = 0; i < ORG_MAX_REMINDERS; i++) {
+                    if ((id == 0 || id == i + 1) && org_sched_.rem[i].used) {
+                        org_sched_.rem[i].used = 0;
+                        removed++;
+                    }
+                }
+                OrgSaveSchedule(org_sched_);
+                return std::string("{\"success\":") + (removed ? "true" : "false") + ",\"removed\":" + std::to_string(removed) + "}";
+            });
+
+        // ---- списки: покупки и заметки ----
+        const char* kListHelp =
+            " list is shopping (список покупок, default) or notes (заметки). "
+            "After the change the list is shown on the screen until the user asks to hide it "
+            "(self.screen.hide). ";
+
+        mcp.AddTool("self.list.add",
+            std::string("Add items to the shopping list or notes (добавь молоко в список, запиши...). "
+                        "items: one item or several separated by commas.") + kListHelp +
+            "Tell the user briefly what was added.",
+            PropertyList({
+                Property("items", kPropertyTypeString),
+                Property("list", kPropertyTypeString, std::string("shopping")),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int id = ListIdFromName(props["list"].value<std::string>());
+                OrgList l;
+                OrgLoadList(id, l);
+                int added = OrgListAdd(l, props["items"].value<std::string>().c_str());
+                OrgSaveList(id, l);
+                PinList(id);
+                bool full = l.count >= ORG_LIST_MAX;
+                return std::string("{\"success\":true,\"added\":") + std::to_string(added) +
+                       ",\"list_now\":" + OrgListJson(l) + (full ? ",\"note\":\"the list is full\"" : "") + "}";
+            });
+
+        mcp.AddTool("self.list.remove",
+            std::string("Remove an item from the shopping list or notes (удали, вычеркни, купил...). "
+                        "item: the item text or its number.") + kListHelp,
+            PropertyList({
+                Property("item", kPropertyTypeString),
+                Property("list", kPropertyTypeString, std::string("shopping")),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int id = ListIdFromName(props["list"].value<std::string>());
+                OrgList l;
+                OrgLoadList(id, l);
+                int idx = OrgListFind(l, props["item"].value<std::string>().c_str());
+                if (idx < 0) return std::string("{\"success\":false,\"error\":\"item not found\",\"list_now\":") + OrgListJson(l) + "}";
+                OrgListRemoveAt(l, idx);
+                OrgSaveList(id, l);
+                PinList(id);
+                return std::string("{\"success\":true,\"list_now\":") + OrgListJson(l) + "}";
+            });
+
+        mcp.AddTool("self.list.edit",
+            std::string("Change an item in the shopping list or notes (исправь, замени, не 2 а 3 литра...). "
+                        "item: the old text or its number, new_text: the new text.") + kListHelp,
+            PropertyList({
+                Property("item", kPropertyTypeString),
+                Property("new_text", kPropertyTypeString),
+                Property("list", kPropertyTypeString, std::string("shopping")),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int id = ListIdFromName(props["list"].value<std::string>());
+                OrgList l;
+                OrgLoadList(id, l);
+                int idx = OrgListFind(l, props["item"].value<std::string>().c_str());
+                if (idx < 0) return std::string("{\"success\":false,\"error\":\"item not found\",\"list_now\":") + OrgListJson(l) + "}";
+                OrgCopyText(l.items[idx], ORG_ITEM_LEN, props["new_text"].value<std::string>().c_str());
+                OrgSaveList(id, l);
+                PinList(id);
+                return std::string("{\"success\":true,\"list_now\":") + OrgListJson(l) + "}";
+            });
+
+        mcp.AddTool("self.list.clear",
+            std::string("Delete everything from the shopping list or notes (очисти список, удали всё).") + kListHelp,
+            PropertyList({ Property("list", kPropertyTypeString, std::string("shopping")) }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int id = ListIdFromName(props["list"].value<std::string>());
+                OrgList l;
+                memset(&l, 0, sizeof(l));
+                OrgSaveList(id, l);
+                PinList(id);
+                return std::string("{\"success\":true}");
+            });
+
+        mcp.AddTool("self.list.show",
+            std::string("Show the shopping list or notes on the screen and read it (покажи список, что купить, "
+                        "мои заметки).") + kListHelp,
+            PropertyList({ Property("list", kPropertyTypeString, std::string("shopping")) }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int id = ListIdFromName(props["list"].value<std::string>());
+                OrgList l;
+                OrgLoadList(id, l);
+                PinList(id);
+                return std::string("{\"success\":true,\"items\":") + OrgListJson(l) + "}";
+            });
+
+        mcp.AddTool("self.screen.hide",
+            "Hide the shopping list, notes or the Wi-Fi QR code from the screen and show the face again. "
+            "Call when the user says хватит показывать, убери список, спрячь, закрой. "
+            "A running timer stays on the screen until it ends or is cancelled.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                user_pin_ = PIN_NONE;
+                UpdatePinned();
+                return std::string("{\"success\":true}");
+            });
+
+        // ---- QR-код Wi-Fi ----
+        mcp.AddTool("self.wifi.show_qr",
+            "Show a QR code on the screen for connecting a phone to the same Wi-Fi network this device "
+            "uses (пароль от вайфая, гостевой вайфай, QR код). The password is not returned to you. "
+            "Tell the user to scan the code with the phone camera. The code hides itself after a few "
+            "minutes or with self.screen.hide.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                wifi_ap_record_t ap;
+                if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+                    return std::string("{\"success\":false,\"error\":\"not connected to Wi-Fi\"}");
+                }
+                char ssid[33];
+                memcpy(ssid, ap.ssid, 32);
+                ssid[32] = 0;
+                std::string pass;
+                wifi_config_t cfg;
+                if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK &&
+                    strncmp((const char*)cfg.sta.ssid, ssid, 32) == 0) {
+                    char p[65];
+                    memcpy(p, cfg.sta.password, 64);
+                    p[64] = 0;
+                    pass = p;
+                }
+                if (pass.empty()) {
+                    for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+                        if (item.ssid == ssid) { pass = item.password; break; }
+                    }
+                }
+                bool open_net = ap.authmode == WIFI_AUTH_OPEN;
+                char qr_text[200];
+                QrWifiString(qr_text, sizeof(qr_text), ssid, pass.c_str(), open_net);
+                auto q = std::make_unique<QrCode>();
+                if (!q->Encode(qr_text)) return std::string("{\"success\":false,\"error\":\"QR code failed\"}");
+                {
+                    std::lock_guard<std::mutex> lock(pin_mutex_);
+                    if (qr_pin_ == nullptr) qr_pin_ = new PinnedScreen();
+                    qr_pin_->kind = PIN_QR;
+                    qr_pin_->SetQr(*q);
+                    OrgCopyText(qr_pin_->caption, sizeof(qr_pin_->caption), ssid);
+                }
+                user_pin_ = PIN_QR;
+                user_pin_until_us_ = esp_timer_get_time() + (int64_t)kQrShowMin * 60 * 1000000;
+                UpdatePinned();
+                return std::string("{\"success\":true,\"network\":\"") + ssid + "\"}";
+            });
+    }
+
   public:
     CustomBoard() : boot_button_(BOOT_BUTTON_GPIO), pwr_button_(VBAT_PWR_GPIO) {
         setenv("TZ", kTimeZone, 1);
@@ -1953,6 +3064,7 @@ mcp_server.AddTool(
         // Проснулись в режиме часов? Тогда обновляем экран и засыпаем обратно,
         // обычный запуск ассистента не нужен. Сюда возвращаемся, только если
         // нажали PWR, то есть пора выйти в обычный режим.
+        OrgRtcEnsure();
         if (s_desk.magic == kDeskMagic && s_desk.active) {
             if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
                 RunDeskWake();
@@ -1961,6 +3073,7 @@ mcp_server.AddTool(
                 s_desk.active = false;   // перезагрузка не из сна: обычный режим
             }
         }
+        if (woke_from_desk_) RestoreOrgAfterDesk();
 
         // Погода, которую помнил режим часов, пригодится как запасная,
         // но при первом вопросе всё равно обновится из сети.
@@ -1979,6 +3092,35 @@ mcp_server.AddTool(
         StartListenLed();
     }
 
+    // Вышли из режима часов: событие, из-за которого проснулись,
+    // и таймер или отложенный будильник, которые ещё не дотикали.
+    void RestoreOrgAfterDesk() {
+        if (s_org.pending_kind != ORG_EV_NONE) {
+            boot_event_.kind = s_org.pending_kind;
+            boot_event_.index = s_org.pending_index;
+            boot_event_.at = s_org.pending_at;
+            s_org.pending_kind = ORG_EV_NONE;
+            skip_greeting_ = true;
+        }
+        int64_t now = (int64_t)time(nullptr);
+        int64_t now_us = esp_timer_get_time();
+        if (IsTimeValidNow() && s_org.timer_end_unix > now) {
+            int left = (int)(s_org.timer_end_unix - now);
+            EnsureTimer();
+            esp_timer_stop(timer_handle_);
+            esp_timer_start_once(timer_handle_, (int64_t)left * 1000000);
+            timer_end_us_ = now_us + (int64_t)left * 1000000;
+            timer_total_s_ = s_org.timer_total_s > 0 ? s_org.timer_total_s : left;
+            pin_dirty_ = true;   // покажем отсчёт, когда экран будет готов
+        }
+        if (IsTimeValidNow() && s_org.snooze_until > now) {
+            snooze_due_us_ = now_us + (s_org.snooze_until - now) * 1000000;
+            snooze_index_ = s_org.snooze_index;
+        }
+        s_org.timer_end_unix = 0;
+        s_org.snooze_until = 0;
+    }
+
     virtual AudioCodec *GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
         // Чувствительность микрофона. Ставится один раз, до первого включения
@@ -1987,6 +3129,7 @@ mcp_server.AddTool(
         if (!gain_set) {
             gain_set = true;
             audio_codec.SetInputGain(kMicGainDb);
+            audio_ready_us_ = esp_timer_get_time();   // звук запускается сейчас
         }
         return &audio_codec;
     }

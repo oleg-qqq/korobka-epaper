@@ -18,6 +18,7 @@
 #include "assets/lang_config.h"
 #include "application.h"
 #include <esp_random.h>
+#include <memory>
 
 #define TAG "CustomLcdDisplay"
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
@@ -29,6 +30,8 @@ static constexpr int kEmotionRevertMs = 1500;    // сколько держит�
 // Минимальное время показа виджета. Если во время него прилетает
 // второй виджет, он ждёт своей очереди, а не затирает первый мгновенно.
 static constexpr int kMinWidgetMs = 5000;
+// Таймер на экране во время разговора обновляется не чаще раза в столько мс.
+static constexpr int kPinTalkRedrawMs = 5000;
 
 
 
@@ -803,7 +806,9 @@ void CustomLcdDisplay::DrawClockScreen(const DeskScreenData& d) {
         snprintf(buf, sizeof(buf), "--:--");
     }
     int tw = PixelTextWidth(buf, 6);
-    DrawPixelText(buf, (Width - tw) / 2, 57, 6);
+    bool org_line = d.next_alarm_at != 0 || d.next_rem_at != 0;
+    DrawPixelText(buf, (Width - tw) / 2, org_line ? 44 : 57, 6);
+    if (org_line) DrawOrgLine(d, 100);
 
     DrawHLine(12, 187, 124, 1);
     DrawVLine(100, 130, 186, 1);
@@ -852,6 +857,13 @@ DeskScreenData::DeskScreenData() {
     for (int i = 0; i < DESK_BATT_POINTS; i++) {
         batt_hist[i] = NAN;
     }
+    memset(&air, 0, sizeof(air));
+    memset(&sea, 0, sizeof(sea));
+    memset(&shop, 0, sizeof(shop));
+    memset(&notes, 0, sizeof(notes));
+    next_rem_text[0] = 0;
+    wifi_ssid[0] = 0;
+    wifi_qr[0] = 0;
 }
 
 // Пороги для лица-настроения комнаты.
@@ -907,20 +919,34 @@ static float SampleAt(const float* v, int n, int64_t t_first, int step, int64_t 
     return a + (b - a) * f;
 }
 
-void CustomLcdDisplay::DrawLine(int x0, int y0, int x1, int y1, int thickness, bool dashed) {
+// Линия толщиной thickness. Толщина идёт поперёк линии: у пологой вниз,
+// у крутой вбок, поэтому крутые участки не становятся тоньше.
+// Пунктир: 3 точки есть, 3 нет. dash_phase позволяет продолжать узор
+// с того же места на следующем отрезке, чтобы пунктир на графике был ровным.
+void CustomLcdDisplay::DrawLine(int x0, int y0, int x1, int y1, int thickness, bool dashed,
+                                int* dash_phase) {
     int dx = abs(x1 - x0), dy = -abs(y1 - y0);
     int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
-    int n = 0;
+    bool steep = -dy > dx;
+    int local_phase = 0;
+    int& n = dash_phase ? *dash_phase : local_phase;
+    bool first = true;
     while (true) {
-        if (!dashed || ((n / 2) % 2) == 0) {
+        // первая точка отрезка совпадает с последней точкой предыдущего:
+        // в узоре её не считаем
+        bool counted = !(first && dash_phase != nullptr && n > 0);
+        if (!dashed || ((n / 3) % 2) == 0) {
             for (int t = 0; t < thickness; t++) {
-                if (x0 >= 0 && x0 < Width && y0 + t >= 0 && y0 + t < Height) {
-                    EPD_DrawColorPixel(x0, y0 + t, DRIVER_COLOR_BLACK);
+                int px = steep ? x0 + t : x0;
+                int py = steep ? y0 : y0 + t;
+                if (px >= 0 && px < Width && py >= 0 && py < Height) {
+                    EPD_DrawColorPixel(px, py, DRIVER_COLOR_BLACK);
                 }
             }
         }
-        n++;
+        if (counted) n++;
+        first = false;
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
         if (e2 >= dy) { err += dy; x0 += sx; }
@@ -989,6 +1015,7 @@ void CustomLcdDisplay::PlotSeries(const float* v, int n, int64_t t_first, int st
     if (range < 0.001f) range = 0.001f;
     bool have_prev = false;
     int px = 0, py = 0;
+    int dash_phase = 0;   // пунктир идёт непрерывно через все отрезки
     for (int i = 0; i < n; i++) {
         int64_t t = t_first + (int64_t)i * step_sec;
         if (std::isnan(v[i]) || t < win_t0 || t > win_t0 + win_span) {
@@ -998,7 +1025,7 @@ void CustomLcdDisplay::PlotSeries(const float* v, int n, int64_t t_first, int st
         int x = x0 + (int)((t - win_t0) * (x1 - x0) / win_span);
         int y = y1 - (int)lroundf((v[i] - vmin) * (y1 - y0) / range);
         if (have_prev) {
-            DrawLine(px, py, x, y, thickness, dashed);
+            DrawLine(px, py, x, y, thickness, dashed, &dash_phase);
         } else {
             // Точка без соседа слева. Если и справа соседа нет, линии не будет,
             // поэтому рисуем её квадратиком, чтобы одиночный замер был виден.
@@ -1405,7 +1432,7 @@ void CustomLcdDisplay::RenderDeskPage(int page, const DeskScreenData& d, const u
                                       bool page_bar) {
     std::lock_guard<std::recursive_mutex> lock(draw_mutex_);
     PaintDeskPage(page, d);
-    if (page_bar) {
+    if (page_bar && page != DESK_PAGE_WIFI) {
         DrawPageBar(page, DESK_PAGE_COUNT);
     }
     PresentAfterWake(old_frame);
@@ -1444,6 +1471,21 @@ void CustomLcdDisplay::PaintDeskPage(int page, const DeskScreenData& d) {
         case DESK_PAGE_BATTERY:
             DrawBatteryScreen(d);
             break;
+        case DESK_PAGE_AIR:
+            DrawAirScreen(d);
+            break;
+        case DESK_PAGE_BEACH:
+            DrawBeachScreen(d);
+            break;
+        case DESK_PAGE_SHOP:
+            PaintListScreen(d.shop, ORG_LIST_SHOP);
+            break;
+        case DESK_PAGE_NOTES:
+            PaintListScreen(d.notes, ORG_LIST_NOTES);
+            break;
+        case DESK_PAGE_WIFI:
+            DrawWifiPage(d);
+            break;
         default:
             DrawClockScreen(d);
             break;
@@ -1459,6 +1501,571 @@ void CustomLcdDisplay::EPD_Sleep() {
     EPD_SendCommand(0x10);   // deep sleep контроллера
     EPD_SendData(0x01);
     vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+// =====================================================================
+// ===================== ТЕКСТ, ОРГАНАЙЗЕР, ВОЗДУХ, МОРЕ ================
+// =====================================================================
+
+// Строка с кириллицей шрифтом 8x16. Если не влезает в max_chars,
+// последний видимый символ заменяется точкой. Возвращает ширину.
+int CustomLcdDisplay::DrawText16(const char* utf8, int x, int y, int max_chars, int scale) {
+    if (utf8 == nullptr) return 0;
+    int total = Utf8Len(utf8);
+    bool cut = total > max_chars;
+    int show = cut ? max_chars : total;
+    const char* p = utf8;
+    int cx = x;
+    for (int n = 0; n < show; n++) {
+        uint32_t cp = Utf8Next(p);
+        if (cp == 0) break;
+        if (cut && n == show - 1) cp = '.';
+        const EpdTextGlyph* g = FindTextGlyph(cp);
+        if (g == nullptr) g = FindTextGlyph('?');
+        if (g != nullptr) {
+            for (int r = 0; r < TEXT_FONT_H; r++) {
+                uint8_t bits = g->rows[r];
+                if (bits == 0) continue;
+                for (int c = 0; c < TEXT_FONT_W; c++) {
+                    if (!(bits & (0x80 >> c))) continue;
+                    for (int sy = 0; sy < scale; sy++) {
+                        for (int sx = 0; sx < scale; sx++) {
+                            int px = cx + c * scale + sx, py = y + r * scale + sy;
+                            if (px >= 0 && px < Width && py >= 0 && py < Height) {
+                                EPD_DrawColorPixel(px, py, DRIVER_COLOR_BLACK);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += TEXT_FONT_W * scale;
+    }
+    return cx - x;
+}
+
+void CustomLcdDisplay::DrawText16Center(const char* utf8, int cx, int y, int scale) {
+    int max_chars = (Width - 8) / (TEXT_FONT_W * scale);
+    int n = Utf8Len(utf8);
+    if (n > max_chars) n = max_chars;
+    DrawText16(utf8, cx - n * TEXT_FONT_W * scale / 2, y, max_chars, scale);
+}
+
+// Разбивает текст на строки по словам, не длиннее max_chars символов.
+// Возвращает число строк (не больше max_lines, остаток обрезается).
+int CustomLcdDisplay::WrapText16(const char* utf8, int max_chars, char lines[][96], int max_lines) {
+    int count = 0;
+    const char* p = utf8;
+    while (*p && count < max_lines) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        // ищем, где закончить строку
+        const char* line_start = p;
+        const char* q = p;
+        const char* last_space = nullptr;
+        int chars = 0;
+        while (*q && chars < max_chars) {
+            if (*q == ' ') last_space = q;
+            Utf8Next(q);
+            chars++;
+        }
+        const char* line_end;
+        if (*q == 0) {
+            line_end = q;
+        } else if (*q == ' ') {
+            line_end = q;
+        } else if (last_space != nullptr && last_space > line_start) {
+            line_end = last_space;
+        } else {
+            line_end = q;   // одно длинное слово: рвём
+        }
+        size_t len = (size_t)(line_end - line_start);
+        if (len > 95) len = 95;
+        memcpy(lines[count], line_start, len);
+        lines[count][len] = 0;
+        count++;
+        p = line_end;
+    }
+    // не всё влезло: в последней строке ставим точку в конце
+    while (*p == ' ') p++;
+    if (*p && count > 0) {
+        size_t l = strlen(lines[count - 1]);
+        if (l < 94) { lines[count - 1][l] = '.'; lines[count - 1][l + 1] = 0; }
+    }
+    return count;
+}
+
+static const char* const kWeekdayShortRu[7] = { "вс", "пн", "вт", "ср", "чт", "пт", "сб" };
+
+// Строка под часами: ближайший будильник и напоминание.
+void CustomLcdDisplay::DrawOrgLine(const DeskScreenData& d, int y) {
+    if (d.next_alarm_at == 0 && d.next_rem_at == 0) return;
+    char buf[40];
+    int x = 12;
+    time_t now = (time_t)d.now;
+    auto when = [&](int64_t at, char* out, size_t cap) {
+        time_t t = (time_t)at;
+        struct tm tm_t;
+        localtime_r(&t, &tm_t);
+        if (at - (int64_t)now < 20 * 3600) {
+            snprintf(out, cap, "%d:%02d", tm_t.tm_hour, tm_t.tm_min);
+        } else {
+            snprintf(out, cap, "%s %d:%02d", kWeekdayShortRu[tm_t.tm_wday], tm_t.tm_hour, tm_t.tm_min);
+        }
+    };
+    if (d.next_alarm_at != 0) {
+        DrawBitmap(ICON_BELL, ICON_SIZE, ICON_SIZE, x, y, 1);
+        when(d.next_alarm_at, buf, sizeof(buf));
+        x += 19;
+        x += DrawText16(buf, x, y) + 10;
+    }
+    if (d.next_rem_at != 0) {
+        DrawBitmap(ICON_CLOCK, ICON_SIZE, ICON_SIZE, x, y, 1);
+        x += 19;
+        when(d.next_rem_at, buf, sizeof(buf));
+        std::string line = buf;
+        if (d.next_rem_text[0]) {
+            line += " ";
+            line += d.next_rem_text;
+        }
+        int max_chars = (188 - x) / TEXT_FONT_W;
+        if (max_chars > 0) DrawText16(line.c_str(), x, y, max_chars);
+    }
+}
+
+// Столбики по часам. vmax: значение, которое займёт всю высоту.
+void CustomLcdDisplay::DrawBars(const uint16_t* v, int n, float scale_div, float vmax,
+                                int x0, int x1, int base, int height) {
+    if (vmax <= 0) return;
+    for (int i = 0; i < n; i++) {
+        if (v[i] == AQ_NONE) continue;
+        float val = v[i] / scale_div;
+        int h = (int)lroundf(val * height / vmax);
+        if (h > height) h = height;
+        if (h <= 0) continue;
+        int xa = x0 + i * (x1 - x0) / n;
+        int xb = x0 + (i + 1) * (x1 - x0) / n - 2;
+        if (xb < xa) xb = xa;
+        FillRect(xa, base - h, xb, base);
+    }
+}
+
+// Сдвигает почасовой ряд так, чтобы [0] был текущим часом.
+static int HoursShift(int64_t hour0, int64_t now) {
+    if (hour0 <= 0 || now <= 0) return 0;
+    int64_t h = (now - hour0) / 3600;
+    if (h < 0) return 0;
+    return (int)h;
+}
+
+static const char* AqiWordRu(int level) {
+    switch (level) {
+        case 0: return "отлично";
+        case 1: return "хорошо";
+        case 2: return "средне";
+        case 3: return "плохо";
+        case 4: return "очень плохо";
+        case 5: return "ужасно";
+    }
+    return "нет данных";
+}
+
+// ----- Воздух: индекс, пыль, PM10, PM2.5 -----
+void CustomLcdDisplay::DrawAirScreen(const DeskScreenData& d) {
+    const AirCache& a = d.air;
+    if (a.magic != kAirMagic || a.aqi == AQ_NONE) {
+        DrawNoDataScreen(ICON_AIR);
+        return;
+    }
+    bool stale = IsTimeValid((time_t)d.now) && a.fetched_unix > 0 && d.now - a.fetched_unix > 26 * 3600;
+    DrawBorder(2, stale);
+    char buf[16];
+    DrawBitmap(ICON_AIR, ICON_SIZE, ICON_SIZE, 10, 8, 1);
+    DrawText16("Воздух", 32, 8);
+    int level = AqiLevel(a.aqi);
+    const char* word = AqiWordRu(level);
+    DrawText16(word, 188 - Utf8Len(word) * TEXT_FONT_W, 8);
+    DrawHLine(12, 187, 28, 1);
+
+    // крупно индекс, рядом подпись
+    snprintf(buf, sizeof(buf), "%d", a.aqi);
+    DrawPixelText(buf, 14, 38, 5);
+    int ax = 14 + PixelTextWidth(buf, 5) + 10;
+    DrawText16("индекс", ax, 40);
+    DrawText16("воздуха", ax, 58);
+
+    // три числа: пыль, PM10, PM2.5 (мкг/м3)
+    const int cols[3] = { 14, 76, 136 };
+    const char* labels[3] = { "пыль", "PM10", "PM2.5" };
+    int vals[3] = {
+        a.dust == AQ_NONE ? -1 : (int)a.dust,
+        a.pm10_10 == AQ_NONE ? -1 : (int)lroundf(a.pm10_10 / 10.0f),
+        a.pm25_10 == AQ_NONE ? -1 : (int)lroundf(a.pm25_10 / 10.0f),
+    };
+    for (int i = 0; i < 3; i++) {
+        DrawText16(labels[i], cols[i], 82);
+        if (vals[i] >= 0) snprintf(buf, sizeof(buf), "%d", vals[i]);
+        else snprintf(buf, sizeof(buf), "-");
+        DrawPixelText(buf, cols[i], 102, 2);
+    }
+
+    // пыль на сутки вперёд столбиками
+    int shift = HoursShift(a.hour0, d.now);
+    uint16_t v[24];
+    float vmax = 50.0f;   // меньше 50 мкг/м3 пыли не растягиваем на всю высоту
+    for (int i = 0; i < 24; i++) {
+        int k = i + shift;
+        v[i] = (k < AQ_HOURS) ? a.dust_next[k] : AQ_NONE;
+        if (v[i] != AQ_NONE && v[i] > vmax) vmax = v[i];
+    }
+    const int base = 164;
+    DrawBars(v, 24, 1.0f, vmax, 30, 186, base, 34);
+    DrawHLine(30, 186, base + 1, 1);
+    DrawBitmap(ICON_AIR, ICON_SIZE, ICON_SIZE, 10, base - 16, 1);
+    DrawTimeAxis(d.hour0 > 0 ? d.hour0 : d.now - d.now % 3600, 24 * 3600, 30, 186, 168, 6);
+}
+
+// ----- Море: вода, волны, можно ли купаться -----
+void CustomLcdDisplay::DrawBeachScreen(const DeskScreenData& d) {
+    const SeaCache& s = d.sea;
+    if (s.magic != kSeaMagic || s.sst10 == -32768) {
+        DrawNoDataScreen(ICON_WAVE);
+        return;
+    }
+    bool stale = IsTimeValid((time_t)d.now) && s.fetched_unix > 0 && d.now - s.fetched_unix > 26 * 3600;
+    DrawBorder(2, stale);
+    char buf[24];
+    DrawBitmap(ICON_WAVE, ICON_SIZE, ICON_SIZE, 10, 8, 1);
+    DrawText16("Море", 32, 8);
+    int verdict = SeaVerdict(s);
+    const char* vw = verdict == 2 ? "купаться: да" : (verdict == 1 ? "можно" : "не стоит");
+    DrawText16(vw, 188 - Utf8Len(vw) * TEXT_FONT_W, 8);
+    DrawHLine(12, 187, 28, 1);
+
+    // слева вода крупно
+    DrawText16("вода", 14, 34);
+    snprintf(buf, sizeof(buf), "%d", (int)lroundf(s.sst10 / 10.0f));
+    DrawPixelText(buf, 14, 56, 5);
+    DrawPixelText("o", 14 + PixelTextWidth(buf, 5) + 3, 56, 2);
+    DrawVLine(100, 34, 108, 1);
+
+    // справа волны и УФ
+    DrawText16("волны", 108, 34);
+    if (s.wave_cm != AQ_NONE) {
+        snprintf(buf, sizeof(buf), "%d.%d", s.wave_cm / 100, (s.wave_cm % 100) / 10);
+        DrawPixelText(buf, 108, 56, 3);
+        DrawText16("м", 108 + PixelTextWidth(buf, 3) + 4, 60);
+    }
+    if (s.wave_max_cm != AQ_NONE) {
+        snprintf(buf, sizeof(buf), "до %d.%d м", s.wave_max_cm / 100, (s.wave_max_cm % 100) / 10);
+        DrawText16(buf, 108, 84);
+    }
+    DrawHLine(12, 187, 112, 1);
+
+    // солнце и воздух одной строкой
+    std::string line;
+    if (d.uv_max >= 0) {
+        snprintf(buf, sizeof(buf), "УФ %d", (int)lroundf(d.uv_max));
+        line += buf;
+    }
+    if (d.weather.valid) {
+        snprintf(buf, sizeof(buf), "%sвоздух %d°", line.empty() ? "" : "  ", RoundTemp(d.weather.temperature));
+        line += buf;
+    }
+    if (!line.empty()) DrawText16(line.c_str(), 14, 116, 21);
+
+    // волны на сутки вперёд столбиками
+    int shift = HoursShift(s.hour0, d.now);
+    uint16_t v[24];
+    float vmax = 100.0f;   // метр волны и больше на всю высоту
+    for (int i = 0; i < 24; i++) {
+        int k = i + shift;
+        v[i] = (k < SEA_HOURS) ? s.wave_next_cm[k] : AQ_NONE;
+        if (v[i] != AQ_NONE && v[i] > vmax) vmax = v[i];
+    }
+    const int base = 164;
+    DrawBars(v, 24, 1.0f, vmax, 30, 186, base, 26);
+    DrawHLine(30, 186, base + 1, 1);
+    DrawBitmap(ICON_WAVE, ICON_SIZE, ICON_SIZE, 10, base - 16, 1);
+    DrawTimeAxis(d.hour0 > 0 ? d.hour0 : d.now - d.now % 3600, 24 * 3600, 30, 186, 168, 6);
+}
+
+// ----- Закреплённые экраны -----
+
+void CustomLcdDisplay::PaintTimerScreen(const PinnedScreen& p, int64_t now_ms) {
+    DrawBorder(2, false);
+    char buf[40];
+    int64_t left_ms = p.timer_end_us / 1000 - now_ms;
+    int left = left_ms > 0 ? (int)((left_ms + 999) / 1000) : 0;
+
+    DrawBitmap(ICON_HOURGLASS, ICON_SIZE, ICON_SIZE, 10, 8, 1);
+    DrawText16("Таймер", 32, 8);
+    time_t now = time(nullptr);
+    if (IsTimeValid(now)) {
+        time_t end = now + left;
+        struct tm tm_e;
+        localtime_r(&end, &tm_e);
+        snprintf(buf, sizeof(buf), "до %d:%02d", tm_e.tm_hour, tm_e.tm_min);
+        DrawText16(buf, 188 - Utf8Len(buf) * TEXT_FONT_W, 8);
+    }
+    DrawHLine(12, 187, 28, 1);
+
+    int scale;
+    if (left >= 3600) {
+        snprintf(buf, sizeof(buf), "%d:%02d:%02d", left / 3600, (left / 60) % 60, left % 60);
+        scale = 4;
+    } else {
+        snprintf(buf, sizeof(buf), "%02d:%02d", left / 60, left % 60);
+        scale = 6;
+    }
+    int tw = PixelTextWidth(buf, scale);
+    DrawPixelText(buf, (Width - tw) / 2, scale == 6 ? 52 : 60, scale);
+
+    // полоса: сколько осталось
+    const int bx0 = 14, bx1 = 186, by0 = 124, by1 = 140;
+    DrawHLine(bx0, bx1, by0, 1);
+    DrawHLine(bx0, bx1, by1, 1);
+    DrawVLine(bx0, by0, by1, 1);
+    DrawVLine(bx1, by0, by1, 1);
+    if (p.timer_total_s > 0) {
+        int inner = bx1 - bx0 - 4;
+        int fill = (int)((int64_t)inner * left / p.timer_total_s);
+        if (fill > inner) fill = inner;
+        if (fill > 0) FillRect(bx0 + 2, by0 + 2, bx0 + 1 + fill, by1 - 2);
+    }
+    if (p.timer_total_s > 0) {
+        int t = p.timer_total_s;
+        if (t >= 3600) snprintf(buf, sizeof(buf), "из %d ч %02d мин", t / 3600, (t / 60) % 60);
+        else if (t % 60 == 0) snprintf(buf, sizeof(buf), "из %d мин", t / 60);
+        else snprintf(buf, sizeof(buf), "из %d:%02d", t / 60, t % 60);
+        DrawText16Center(buf, 100, 154);
+    }
+}
+
+void CustomLcdDisplay::PaintListScreen(const OrgList& l, int list_id) {
+    DrawBorder(2, false);
+    char buf[16];
+    bool notes = list_id == ORG_LIST_NOTES;
+    DrawBitmap(notes ? ICON_NOTE : ICON_CART, ICON_SIZE, ICON_SIZE, 10, 7, 1);
+    DrawText16(notes ? "Заметки" : "Покупки", 32, 7);
+    if (l.count > 0) {
+        snprintf(buf, sizeof(buf), "%d", l.count);
+        DrawText16(buf, 188 - (int)strlen(buf) * TEXT_FONT_W, 7);
+    }
+    DrawHLine(12, 187, 27, 1);
+
+    if (l.count == 0) {
+        DrawText16Center(notes ? "Заметок нет" : "Список пуст", 100, 80);
+        DrawText16Center(notes ? "Скажи: запиши..." : "Скажи: добавь хлеб", 100, 104);
+        return;
+    }
+    const int top = 32, step = 18, rows = 9;
+    if (l.count <= rows) {
+        for (int i = 0; i < l.count; i++) {
+            int y = top + i * step;
+            // квадратик-чекбокс
+            DrawHLine(12, 21, y + 3, 1);
+            DrawHLine(12, 21, y + 12, 1);
+            DrawVLine(12, y + 3, y + 12, 1);
+            DrawVLine(21, y + 3, y + 12, 1);
+            DrawText16(l.items[i], 26, y, (188 - 26) / TEXT_FONT_W);
+        }
+        return;
+    }
+    // много пунктов: две колонки
+    const int col_x[2] = { 10, 102 };
+    int shown = l.count > rows * 2 ? rows * 2 - 1 : l.count;
+    for (int i = 0; i < shown; i++) {
+        int col = i / rows, row = i % rows;
+        int x = col_x[col], y = top + row * step;
+        FillRect(x + 1, y + 6, x + 4, y + 9);   // точка вместо чекбокса
+        DrawText16(l.items[i], x + 8, y, (86 - 8) / TEXT_FONT_W);
+    }
+    if (shown < l.count) {
+        snprintf(buf, sizeof(buf), "+%d", l.count - shown);
+        DrawText16(buf, col_x[1] + 8, top + (rows - 1) * step);
+    }
+    DrawVLine(98, 30, 194, 1);
+}
+
+void CustomLcdDisplay::PaintQrScreen(const PinnedScreen& p) {
+    // Рамку не рисуем: вокруг кода должно быть чисто.
+    DrawBitmap(ICON_WIFI, ICON_SIZE, ICON_SIZE, 8, 5, 1);
+    DrawText16(p.caption, 28, 5, (196 - 28) / TEXT_FONT_W);
+    if (p.qr_size <= 0) return;
+    const int area_top = 26, area = 170;
+    int scale = area / (p.qr_size + 4);
+    if (scale < 1) scale = 1;
+    int side = p.qr_size * scale;
+    int x0 = (Width - side) / 2;
+    int y0 = area_top + (area - side) / 2;
+    for (int y = 0; y < p.qr_size; y++) {
+        for (int x = 0; x < p.qr_size; x++) {
+            if (p.QrGet(x, y)) FillRect(x0 + x * scale, y0 + y * scale, x0 + x * scale + scale - 1, y0 + y * scale + scale - 1);
+        }
+    }
+}
+
+
+// QR как можно крупнее. Вокруг оставляем чистое поле в 2 клетки,
+// без него телефон может не узнать код. Подпись снизу, если влезает.
+void CustomLcdDisplay::DrawQrBig(const QrCode& q, const char* caption) {
+    if (q.size <= 0) return;
+    int scale = (Width - 4) / (q.size + 4);
+    if (scale < 1) scale = 1;
+    int side = q.size * scale;
+    int margin = (Width - side) / 2;
+    bool with_caption = caption != nullptr && caption[0] != 0 &&
+                        margin - 2 * scale >= TEXT_FONT_H + 2;
+    int x0 = margin;
+    int y0 = margin;
+    for (int y = 0; y < q.size; y++) {
+        for (int x = 0; x < q.size; x++) {
+            if (q.Get(x, y)) FillRect(x0 + x * scale, y0 + y * scale, x0 + x * scale + scale - 1, y0 + y * scale + scale - 1);
+        }
+    }
+    if (with_caption) {
+        DrawText16Center(caption, Width / 2, Height - TEXT_FONT_H - 1);
+    }
+}
+
+// Страница режима часов: домашний Wi-Fi на весь экран.
+void CustomLcdDisplay::DrawWifiPage(const DeskScreenData& d) {
+    if (d.wifi_qr[0] == 0) {
+        DrawNoDataScreen(ICON_WIFI);
+        return;
+    }
+    auto q = std::make_unique<QrCode>();
+    if (!q->Encode(d.wifi_qr)) {
+        DrawNoDataScreen(ICON_WIFI);
+        return;
+    }
+    DrawQrBig(*q, d.wifi_ssid);
+}
+
+void CustomLcdDisplay::PaintAlertScreen(const PinnedScreen& p) {
+    char buf[24];
+    time_t at = (time_t)p.alert_at;
+    struct tm tm_a;
+    localtime_r(&at, &tm_a);
+    bool at_ok = IsTimeValid(at);
+
+    if (p.alert_kind == ALERT_ALARM) {
+        DrawBorder(3, false);
+        DrawBitmap(ICON_BELL, ICON_SIZE, ICON_SIZE, (Width - ICON_SIZE * 3) / 2, 10, 3);
+        if (at_ok) snprintf(buf, sizeof(buf), "%02d:%02d", tm_a.tm_hour, tm_a.tm_min);
+        else snprintf(buf, sizeof(buf), "--:--");
+        DrawPixelText(buf, (Width - PixelTextWidth(buf, 5)) / 2, 66, 5);
+        DrawText16Center(p.alert_text[0] ? p.alert_text : "Будильник", 100, 110);
+        DrawHLine(12, 187, 140, 1);
+        DrawText16("PWR  - выключить", 16, 150);
+        DrawText16("BOOT - ещё 9 мин", 16, 172);
+        return;
+    }
+    if (p.alert_kind == ALERT_TIMER) {
+        DrawBorder(3, false);
+        DrawBitmap(ICON_HOURGLASS, ICON_SIZE, ICON_SIZE, (Width - ICON_SIZE * 3) / 2, 12, 3);
+        DrawText16Center("Время вышло!", 100, 72);
+        DrawPixelText("00:00", (Width - PixelTextWidth("00:00", 5)) / 2, 100, 5);
+        DrawHLine(12, 187, 150, 1);
+        DrawText16Center("PWR или BOOT - ок", 100, 164);
+        return;
+    }
+    // напоминание
+    DrawBorder(3, false);
+    DrawBitmap(ICON_CLOCK, ICON_SIZE, ICON_SIZE, 12, 10, 2);
+    DrawText16("Напоминание", 50, 8);
+    if (at_ok) {
+        snprintf(buf, sizeof(buf), "%d:%02d", tm_a.tm_hour, tm_a.tm_min);
+        DrawText16(buf, 50, 26);
+    }
+    DrawHLine(12, 187, 48, 1);
+    char lines[6][96];
+    int n = WrapText16(p.alert_text, (188 - 14) / TEXT_FONT_W, lines, 6);
+    for (int i = 0; i < n; i++) DrawText16(lines[i], 14, 54 + i * 18);
+    DrawHLine(12, 187, 164, 1);
+    DrawText16Center("PWR или BOOT - ок", 100, 172);
+}
+
+void CustomLcdDisplay::PaintPinned(const PinnedScreen& p, int64_t now_ms) {
+    EPD_Clear();
+    switch (p.kind) {
+        case PIN_TIMER: PaintTimerScreen(p, now_ms); break;
+        case PIN_LIST:  PaintListScreen(p.list, p.list_id); break;
+        case PIN_QR:    PaintQrScreen(p); break;
+        case PIN_ALERT: PaintAlertScreen(p); break;
+        default: break;
+    }
+}
+
+bool CustomLcdDisplay::SetPinned(const PinnedScreen& p) {
+    if (pin_req_ == nullptr) return false;   // аниматор ещё не запущен
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        *pin_req_ = p;
+        pin_active_ = p.kind != PIN_NONE;
+        pin_version_++;
+    }
+    if (face_task_ != nullptr) xTaskNotifyGive(face_task_);
+    return true;
+}
+
+void CustomLcdDisplay::ClearPinned() {
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        if (!pin_active_) return;
+        pin_active_ = false;
+        pin_version_++;
+    }
+    force_redraw_ = true;   // лицо вернётся на ближайшем шаге
+    if (face_task_ != nullptr) xTaskNotifyGive(face_task_);
+}
+
+bool CustomLcdDisplay::HasPinned() {
+    std::lock_guard<std::mutex> lock(req_mutex_);
+    return pin_active_;
+}
+
+// Рисует закреплённый экран, если он есть. true: экран занят им,
+// лицо рисовать не надо.
+bool CustomLcdDisplay::ServePinned(int64_t now_ms, FaceMode mode) {
+    bool active;
+    int version;
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        active = pin_active_;
+        version = pin_version_;
+        if (active && version != pin_drawn_version_) *pin_shown_ = *pin_req_;
+    }
+    if (!active) {
+        pin_drawn_version_ = -1;
+        return false;
+    }
+    bool need = version != pin_drawn_version_;
+    int value = -1;
+    if (pin_shown_->kind == PIN_TIMER) {
+        int64_t left_ms = pin_shown_->timer_end_us / 1000 - now_ms;
+        value = left_ms > 0 ? (int)((left_ms + 999) / 1000) : 0;
+        bool talking = (mode == FaceMode::kSpeaking || mode == FaceMode::kListening ||
+                        mode == FaceMode::kEmotion);
+        // в разговоре цифры реже, чтобы не мешать звуку
+        int period = talking ? kPinTalkRedrawMs : 900;
+        if (value != pin_last_value_ && (now_ms - pin_last_draw_ms_ >= period || value == 0)) need = true;
+    }
+    if (!need) return true;
+
+    std::lock_guard<std::recursive_mutex> lock(draw_mutex_);
+    FaceMode m = face_mode_;
+    if (m == FaceMode::kShuttingDown || m == FaceMode::kBooting || m == FaceMode::kWidget || booting_) {
+        return true;
+    }
+    current_face_ = -1;
+    PaintPinned(*pin_shown_, now_ms);
+    EPD_DisplayPart();
+    pin_drawn_version_ = version;
+    pin_last_draw_ms_ = now_ms;
+    pin_last_value_ = value;
+    return true;
 }
 
 // ===== Виджеты по голосу =====
@@ -1512,9 +2119,16 @@ void CustomLcdDisplay::ServeWidget(int64_t now_ms) {
     }
 
     bool have_req;
+    bool alert;
     {
         std::lock_guard<std::mutex> lock(req_mutex_);
+        alert = pin_active_ && pin_req_ != nullptr && pin_req_->kind == PIN_ALERT;
+        if (alert) req_pending_ = false;   // пока звонит, виджеты не нужны
         have_req = req_pending_;
+    }
+    if (alert && mode == FaceMode::kWidget) {
+        HideWidget();
+        return;
     }
 
     if (have_req) {
@@ -1540,6 +2154,7 @@ void CustomLcdDisplay::ServeWidget(int64_t now_ms) {
         current_face_ = -1;
         PaintDeskPage(page, *shown_data_);
         EPD_DisplayPart();
+        pin_drawn_version_ = -1;   // после виджета закреплённый экран нарисуется заново
         last_draw_ms_ = now_ms;
         widget_started_ms_ = now_ms;
         widget_until_ms_ = now_ms + (int64_t)seconds * 1000;
@@ -1631,6 +2246,8 @@ void CustomLcdDisplay::StartAnimator() {
     if (face_task_ != nullptr) return;
     if (req_data_ == nullptr) req_data_ = new DeskScreenData();
     if (shown_data_ == nullptr) shown_data_ = new DeskScreenData();
+    if (pin_req_ == nullptr) pin_req_ = new PinnedScreen();
+    if (pin_shown_ == nullptr) pin_shown_ = new PinnedScreen();
     last_tick_ms_ = esp_timer_get_time() / 1000;
     BaseType_t ok = xTaskCreate([](void* arg) {
         static_cast<CustomLcdDisplay*>(arg)->FaceTask();
@@ -1961,6 +2578,13 @@ void CustomLcdDisplay::AnimTick() {
         mode == FaceMode::kWidget || booting_) {
         last_mode_ = mode;
         force_redraw_ = true;   // после виджета или загрузки лицо нарисуется заново
+        return;
+    }
+
+    // Закреплённый экран (таймер, список, QR, будильник) вместо лица.
+    if (pin_shown_ != nullptr && ServePinned(now, mode)) {
+        last_mode_ = mode;
+        force_redraw_ = true;   // когда его уберут, лицо нарисуется заново
         return;
     }
 

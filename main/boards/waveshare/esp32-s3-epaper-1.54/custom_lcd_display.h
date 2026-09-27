@@ -5,6 +5,9 @@
 #include "lcd_display.h"
 #include "pixel_face.h"
 #include "widget_art.h"
+#include "text_font.h"
+#include "qr_code.h"
+#include "organizer.h"
 #include <mutex>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -62,7 +65,83 @@ struct DeskScreenData {
     int64_t sunset = 0;
     float uv_max = -1.0f;
 
+    // воздух и море (magic = 0, если данных нет)
+    AirCache air;
+    SeaCache sea;
+
+    // органайзер для строки на часах
+    int64_t next_alarm_at = 0;          // ближайший будильник, 0 нет
+    uint8_t next_alarm_days = 0;
+    int64_t next_rem_at = 0;            // ближайшее напоминание, 0 нет
+    char next_rem_text[ORG_REM_TEXT];
+    bool night = false;                 // ночная экономия: экран обновляется реже
+
+    // списки
+    OrgList shop;
+    OrgList notes;
+
+    // Wi-Fi для QR: имя сети и готовая строка WIFI:... (пусто, если неизвестно)
+    char wifi_ssid[33];
+    char wifi_qr[200];
+
     DeskScreenData();
+};
+
+// Закреплённый экран: держится вместо лица, пока его не уберут.
+enum PinKind {
+    PIN_NONE = 0,
+    PIN_TIMER,      // обратный отсчёт таймера
+    PIN_LIST,       // список покупок или заметки
+    PIN_QR,         // QR-код Wi-Fi
+    PIN_ALERT,      // звонит будильник, напоминание, таймер закончился
+};
+
+enum AlertKind {
+    ALERT_ALARM = 0,
+    ALERT_REMINDER,
+    ALERT_TIMER,
+};
+
+struct PinnedScreen {
+    int kind = PIN_NONE;
+    // таймер
+    int64_t timer_end_us = 0;          // когда закончится (esp_timer_get_time)
+    int timer_total_s = 0;
+    // список
+    int list_id = 0;
+    OrgList list;
+    // QR
+    int qr_size = 0;
+    uint8_t qr_bits[(QR_MAX_SIZE * QR_MAX_SIZE + 7) / 8];
+    char caption[40];
+    // оповещение
+    int alert_kind = ALERT_ALARM;
+    int64_t alert_at = 0;              // на какое время был будильник/напоминание
+    char alert_text[ORG_REM_TEXT];
+
+    PinnedScreen() {
+        memset(&list, 0, sizeof(list));
+        memset(qr_bits, 0, sizeof(qr_bits));
+        caption[0] = 0;
+        alert_text[0] = 0;
+    }
+    void SetQr(const QrCode& q) {
+        qr_size = q.size;
+        memset(qr_bits, 0, sizeof(qr_bits));
+        for (int y = 0; y < q.size; y++) {
+            for (int x = 0; x < q.size; x++) {
+                if (q.Get(x, y)) {
+                    int i = y * q.size + x;
+                    qr_bits[i >> 3] |= (uint8_t)(0x80 >> (i & 7));
+                }
+            }
+        }
+    }
+    bool QrGet(int x, int y) const {
+        if (x < 0 || y < 0 || x >= qr_size || y >= qr_size) return false;
+        int i = y * qr_size + x;
+        return (qr_bits[i >> 3] & (0x80 >> (i & 7))) != 0;
+    }
 };
 
 // Страницы режима часов, листаются кнопкой BOOT по кругу.
@@ -70,12 +149,17 @@ enum DeskPage {
     DESK_PAGE_CLOCK = 0,    // часы, дата, дом и улица коротко
     DESK_PAGE_WEATHER,      // погода и прогноз на 3 дня
     DESK_PAGE_OUT24,        // улица: температура и дождь на сутки вперёд
+    DESK_PAGE_AIR,          // воздух: индекс, пыль, PM10, PM2.5
+    DESK_PAGE_BEACH,        // море: вода, волны, можно ли купаться
     DESK_PAGE_ROOM,         // комната сейчас
     DESK_PAGE_ROOM24,       // комната: графики за сутки
     DESK_PAGE_BOTH,         // дом и улица за сутки, когда проветривать
     DESK_PAGE_SUN,          // восход, закат, УФ
     DESK_PAGE_MOON,         // фаза луны
     DESK_PAGE_BATTERY,      // батарея за неделю
+    DESK_PAGE_SHOP,         // список покупок (пропускается, если пуст)
+    DESK_PAGE_NOTES,        // заметки (пропускается, если пусто)
+    DESK_PAGE_WIFI,         // QR-код домашнего Wi-Fi на весь экран
     DESK_PAGE_COUNT
 };
 
@@ -107,6 +191,12 @@ public:
     void ShowWeatherWidget(const WeatherCache& w, int seconds);
     void ShowRoomWidget(float temperature, float humidity, int seconds);
     void ShowDeskWidget(int page, const DeskScreenData& d, int seconds);   // любая страница часов
+
+    // Закреплённый экран (таймер, список, QR, будильник). Держится вместо
+    // лица, пока не уберут. Виджеты показываются поверх него и уходят.
+    bool SetPinned(const PinnedScreen& p);   // false: экран ещё не готов, повторить позже
+    void ClearPinned();
+    bool HasPinned();
 
     /* режим часов (deep sleep) */
     // Рисует страницу и выводит её на экран. old_frame: что было на экране
@@ -261,7 +351,8 @@ private:
     void DrawBatteryScreen(const DeskScreenData& d);
     void DrawNoDataScreen(const char* const* icon);
     // графики
-    void DrawLine(int x0, int y0, int x1, int y1, int thickness, bool dashed);
+    void DrawLine(int x0, int y0, int x1, int y1, int thickness, bool dashed,
+                  int* dash_phase = nullptr);
     void DrawDottedHLine(int x0, int x1, int y);
     void FillCircle(int cx, int cy, int r);
     void DrawRing(int cx, int cy, int r, int thickness);
@@ -276,6 +367,34 @@ private:
     void PresentAfterWake(const uint8_t* old_frame);
     void DrawPageBar(int page, int count);
     void PaintDeskPage(int page, const DeskScreenData& d);   // страница в буфер, без вывода
+
+    // закреплённый экран
+    PinnedScreen* pin_req_ = nullptr;      // что прислала плата (под req_mutex_)
+    PinnedScreen* pin_shown_ = nullptr;    // копия для рисования (только задача лица)
+    bool pin_active_ = false;              // под req_mutex_
+    int pin_version_ = 0;                  // растёт при каждой новой заявке
+    int pin_drawn_version_ = -1;
+    int64_t pin_last_draw_ms_ = 0;
+    int pin_last_value_ = -1;              // что показано (для таймера: секунды)
+    bool ServePinned(int64_t now_ms, FaceMode mode);
+    void PaintPinned(const PinnedScreen& p, int64_t now_ms);
+    void PaintTimerScreen(const PinnedScreen& p, int64_t now_ms);
+    void PaintListScreen(const OrgList& l, int list_id);
+    void PaintQrScreen(const PinnedScreen& p);
+    void DrawWifiPage(const DeskScreenData& d);
+    void DrawQrBig(const QrCode& q, const char* caption);
+    void PaintAlertScreen(const PinnedScreen& p);
+
+    // текст с кириллицей (шрифт 8x16)
+    int DrawText16(const char* utf8, int x, int y, int max_chars = 1000, int scale = 1);
+    void DrawText16Center(const char* utf8, int cx, int y, int scale = 1);
+    int WrapText16(const char* utf8, int max_chars, char lines[][96], int max_lines);
+
+    // новые страницы
+    void DrawAirScreen(const DeskScreenData& d);
+    void DrawBeachScreen(const DeskScreenData& d);
+    void DrawOrgLine(const DeskScreenData& d, int y);
+    void DrawBars(const uint16_t* v, int n, float scale_div, float vmax, int x0, int x1, int base, int height);
 
     // виджеты по голосу: одна заявка в очереди, рисует задача лица
     std::mutex req_mutex_;
