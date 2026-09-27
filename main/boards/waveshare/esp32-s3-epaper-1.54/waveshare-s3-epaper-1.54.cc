@@ -36,6 +36,7 @@
 #include "ssid_manager.h"
 #include <nvs.h>
 #include <math.h>
+#include <cmath>
 #include <memory>
 #define TAG "waveshare_epaper_1_54"
 
@@ -47,7 +48,7 @@ static constexpr const char* kTimeZone = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 // Усиление микрофона в дБ. У кодека ступени по 6 дБ: 0, 6, 12 ... 42.
 // По умолчанию в xiaozhi 30. Каждые +6 дБ это примерно вдвое громче.
 // Если он начнёт слышать сам себя или шипеть, верни на 30.
-static constexpr float kMicGainDb = 36.0f;
+static constexpr float kMicGainDb = 30.0f;
 
 static bool IsTimeValidNow() {
     return time(nullptr) > 1600000000;   // время уже пришло из сети
@@ -73,6 +74,15 @@ static constexpr int kDeskWifiTimeoutMs = 12000;           // сколько ж�
 static constexpr uint32_t kDeskMagic = 0x4B4F5242;         // метка "данные режима часов настоящие"
 static constexpr int kDeskFrameBytes = 5000;               // размер кадра экрана 200x200 по 1 биту
 static constexpr bool kDeskPageBarAlways = false;          // true: полоска страниц видна всегда, а не только при листании
+
+// ===== ВИДЖЕТЫ ПО ГОЛОСУ =====
+static constexpr int kVoiceWidgetSec = 15;   // сколько секунд виджет на экране во время разговора
+
+// ===== АВТОСОН =====
+// Если столько минут подряд никто не разговаривает, устройство само
+// уходит в режим часов (как по кнопке PWR). 0 = никогда не засыпать.
+// Не засыпает, пока идёт таймер или секундомер.
+static constexpr int kAutoDeskAfterMin = 5;
 
 // Погода в простом виде, который переживает глубокий сон.
 struct DeskRtcWeather {
@@ -738,6 +748,29 @@ class CustomBoard : public WifiBoard {
         HistRecord(ok, t, h, (int)BatterygetPercent());
     }
 
+    // Автосон: считаем, сколько устройство подряд простаивает без
+    // разговора. Любое общение, таймер или секундомер сбрасывают отсчёт.
+    int64_t idle_since_us_ = 0;
+    void AutoDeskTick() {
+        if (kAutoDeskAfterMin <= 0 || desk_entering_) return;
+        auto& app = Application::GetInstance();
+        int64_t now = esp_timer_get_time();
+        bool timer_busy = timer_end_us_ != 0 && now < timer_end_us_ + 60LL * 1000000;   // минута на будильник
+        if (app.GetDeviceState() != kDeviceStateIdle || timer_busy || stopwatch_running_) {
+            idle_since_us_ = 0;
+            return;
+        }
+        if (idle_since_us_ == 0) {
+            idle_since_us_ = now;
+            return;
+        }
+        if (now - idle_since_us_ >= (int64_t)kAutoDeskAfterMin * 60 * 1000000) {
+            ESP_LOGI(TAG, "Auto sleep: idle for %d min, entering desk mode", kAutoDeskAfterMin);
+            idle_since_us_ = 0;
+            RequestDeskMode(false);
+        }
+    }
+
     // Запускает таймер мигания. Период 400 мс даёт спокойное,
     // заметное мигание. Меньше значение, быстрее моргает.
     void StartListenLed() {
@@ -747,6 +780,7 @@ class CustomBoard : public WifiBoard {
             self->UpdateListenLed();
             self->CheckWifiSignal();
             self->HistoryTick();
+            self->AutoDeskTick();
         };
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
@@ -795,7 +829,7 @@ class CustomBoard : public WifiBoard {
     "what's it like outside, погода, температура на улице. "
     "Returns a short description of current conditions and temperature. "
     "Announce the result to the user in their language. "
-    "The device shows the result on its small screen for about twelve "
+    "The device shows the result on its small screen for a few "
     "seconds, then the screen goes back to the face. Call this tool every "
     "time the user asks, including when they ask to show it again. "
     "Never say that it is already on the screen. ",
@@ -805,7 +839,7 @@ class CustomBoard : public WifiBoard {
                 if (!GetWeather(w)) {
                     return std::string("Не удалось получить данные о погоде, попробуйте позже");
                 }
-                display_->ShowWeatherWidget(w, 12);
+                display_->ShowWeatherWidget(w, kVoiceWidgetSec);
                 return w.summary;
             });
 			
@@ -815,7 +849,7 @@ class CustomBoard : public WifiBoard {
             "Get current room temperature in Celsius and humidity in percent from the built-in sensor. "
             "Call this every time the user asks about the room, home temperature "
             "or humidity, температура дома, в комнате, влажность. "
-            "The device shows these values on its small screen for about twelve "
+            "The device shows these values on its small screen for a few "
             "seconds, then the screen goes back to the face. Call this tool every "
             "time the user asks, including when they ask to show it again. "
             "Never say that it is already on the screen. ",
@@ -824,27 +858,64 @@ class CustomBoard : public WifiBoard {
                 if (!ReadSHTC3(t, h)) {
                     return std::string("{\"success\":false}");
                 }
-                display_->ShowRoomWidget(t, h, 12);
+                display_->ShowRoomWidget(t, h, kVoiceWidgetSec);
                 char buf[96];
                 snprintf(buf, sizeof(buf),
                     "{\"success\":true,\"temperature\":%.1f,\"humidity\":%.1f}", t, h);
                 return std::string(buf);
             });
 			       
-// уровень заряда
+// уровень заряда (и график батареи на экране)
         mcp_server.AddTool(
             "self.battery.get_level",
-            "Get the current battery charge level in percent. "
+            "Get the current battery charge level in percent and an estimate of days left. "
             "Call this when the user asks about the battery, the charge, "
             "how much power is left, заряд, батарея, сколько осталось заряда, "
             "на сколько хватит. "
-            "Returns a number from 0 to 100. "
+            "The device shows the battery chart for the week on its screen for a few seconds. "
             "Tell the user the number in their language, briefly.",
             PropertyList(),
             [this](const PropertyList &) -> ReturnValue {
-                int level = (int)BatterygetPercent();
-                ESP_LOGI(TAG, "Battery: %d%%", level);
-                return std::string("{\"percent\":") + std::to_string(level) + "}";
+                auto dp = std::make_unique<DeskScreenData>();
+                CollectLiveData(*dp, DESK_PAGE_BATTERY);
+                ESP_LOGI(TAG, "Battery: %d%%", dp->battery);
+                display_->ShowDeskWidget(DESK_PAGE_BATTERY, *dp, kVoiceWidgetSec);
+                return DescribePage(DESK_PAGE_BATTERY, *dp);
+            });
+
+// любой экран режима часов по голосу
+        mcp_server.AddTool(
+            "self.screen.show",
+            "Show an information screen on the device display for a few seconds "
+            "and get the data shown on it. Use it in the middle of a conversation too, "
+            "every time the user asks about one of these topics or asks to show it. "
+            "page is one of: "
+            "clock (current time, date, day of week; время, который час, дата, какой день), "
+            "forecast (outside temperature and chance of rain for the next 24 hours; "
+            "прогноз на сутки, будет ли дождь, зонт), "
+            "room_history (room temperature and humidity chart for the last 24 hours; "
+            "график температуры дома, как менялась влажность), "
+            "ventilate (home vs outside temperature for 24 hours, when to open the windows; "
+            "проветрить, открыть окно, где теплее, дома или на улице), "
+            "sun (sunrise, sunset, day length, UV index; восход, закат, солнце, ультрафиолет), "
+            "moon (moon phase; луна, фаза луны, полнолуние), "
+            "battery (battery chart for the week and days left). "
+            "For the current weather prefer self.weather.get_current, for the room right now "
+            "prefer self.sensor.get_room_climate. "
+            "Tell the user the result briefly in their language. "
+            "Never say that it is already on the screen.",
+            PropertyList({Property("page", kPropertyTypeString)}),
+            [this](const PropertyList &properties) -> ReturnValue {
+                std::string name = properties["page"].value<std::string>();
+                int page = PageFromName(name);
+                if (page < 0) {
+                    return std::string("{\"success\":false,\"error\":\"unknown page, use one of: "
+                                       "clock, forecast, room_history, ventilate, sun, moon, battery\"}");
+                }
+                auto dp = std::make_unique<DeskScreenData>();
+                CollectLiveData(*dp, page);
+                display_->ShowDeskWidget(page, *dp, kVoiceWidgetSec);
+                return DescribePage(page, *dp);
             });
 			//бросить кубик
 			mcp_server.AddTool(
@@ -1459,6 +1530,172 @@ mcp_server.AddTool(
         d.battery = (int)BatterygetPercent();
         HistRecord(d.room_ok, d.room_t, d.room_h, d.battery);
         FillChartData(d);
+    }
+
+    // ===== Виджеты во время разговора =====
+    // Любая страница режима часов по голосу. Сначала собираем свежие данные,
+    // потом отдаём экрану (он нарисует сам) и возвращаем цифры для ответа.
+
+    static int PageFromName(const std::string& name) {
+        struct { const char* name; int page; } kNames[] = {
+            { "clock", DESK_PAGE_CLOCK },       { "time", DESK_PAGE_CLOCK },
+            { "weather", DESK_PAGE_WEATHER },   { "forecast", DESK_PAGE_OUT24 },
+            { "rain", DESK_PAGE_OUT24 },        { "room", DESK_PAGE_ROOM },
+            { "room_history", DESK_PAGE_ROOM24 }, { "ventilate", DESK_PAGE_BOTH },
+            { "sun", DESK_PAGE_SUN },           { "moon", DESK_PAGE_MOON },
+            { "battery", DESK_PAGE_BATTERY },
+        };
+        for (auto& n : kNames) {
+            if (name == n.name) return n.page;
+        }
+        return -1;
+    }
+
+    void CollectLiveData(DeskScreenData& d, int page) {
+        bool need_weather = (page == DESK_PAGE_CLOCK || page == DESK_PAGE_WEATHER ||
+                             page == DESK_PAGE_OUT24 || page == DESK_PAGE_BOTH ||
+                             page == DESK_PAGE_SUN);
+        if (need_weather) {
+            WeatherCache w;
+            if (GetWeather(w)) d.weather = w;   // из кэша или свежая из сети
+        } else if (s_weather_cache.valid) {
+            d.weather = s_weather_cache;
+        }
+        float t = 0, h = 0;
+        d.room_ok = ReadSHTC3(t, h);
+        d.room_t = t;
+        d.room_h = h;
+        d.battery = (int)BatterygetPercent();
+        HistRecord(d.room_ok, d.room_t, d.room_h, d.battery);
+        FillChartData(d);
+        if (d.now == 0) d.now = (int64_t)time(nullptr);
+    }
+
+    static void MinMax(const float* v, int n, float& lo, float& hi, int& count) {
+        lo = 1e9f; hi = -1e9f; count = 0;
+        for (int i = 0; i < n; i++) {
+            if (std::isnan(v[i])) continue;
+            if (v[i] < lo) lo = v[i];
+            if (v[i] > hi) hi = v[i];
+            count++;
+        }
+    }
+
+    static std::string HourMin(int64_t t) {
+        time_t tt = (time_t)t;
+        struct tm tm_l;
+        localtime_r(&tt, &tm_l);
+        char buf[8];
+        strftime(buf, sizeof(buf), "%H:%M", &tm_l);
+        return buf;
+    }
+
+    // Короткие данные о показанной странице, чтобы ассистенту было что сказать.
+    static std::string DescribePage(int page, const DeskScreenData& d) {
+        char buf[256];
+        bool time_ok = IsTimeValidNow();
+        switch (page) {
+            case DESK_PAGE_CLOCK: {
+                if (!time_ok) return "{\"success\":false,\"error\":\"time is not known yet\"}";
+                time_t tt = (time_t)d.now;
+                struct tm tm_l;
+                localtime_r(&tt, &tm_l);
+                char tb[48];
+                strftime(tb, sizeof(tb), "\"time\":\"%H:%M\",\"date\":\"%Y-%m-%d\",\"weekday\":\"%A\"", &tm_l);
+                return std::string("{\"success\":true,") + tb + "}";
+            }
+            case DESK_PAGE_WEATHER:
+                if (!d.weather.valid) return "{\"success\":false,\"error\":\"no weather data\"}";
+                return d.weather.summary;
+            case DESK_PAGE_OUT24: {
+                float lo, hi; int n;
+                MinMax(d.out_next, 25, lo, hi, n);
+                if (n == 0) return "{\"success\":false,\"error\":\"no forecast yet\"}";
+                int rain_max = -1, rain_at = 0;
+                for (int i = 0; i < 24; i++) {
+                    if (!std::isnan(d.rain_next[i]) && (int)d.rain_next[i] > rain_max) {
+                        rain_max = (int)d.rain_next[i];
+                        rain_at = i;
+                    }
+                }
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"next24h_min_c\":%.0f,\"next24h_max_c\":%.0f,"
+                    "\"max_rain_chance_percent\":%d,\"max_rain_in_hours\":%d}",
+                    lo, hi, rain_max < 0 ? 0 : rain_max, rain_at);
+                return buf;
+            }
+            case DESK_PAGE_ROOM:
+                if (!d.room_ok) return "{\"success\":false,\"error\":\"sensor did not answer\"}";
+                snprintf(buf, sizeof(buf), "{\"success\":true,\"temperature\":%.1f,\"humidity\":%.0f}",
+                         d.room_t, d.room_h);
+                return buf;
+            case DESK_PAGE_ROOM24: {
+                float tlo, thi, hlo, hhi; int nt, nh;
+                MinMax(d.room_t_hist, DESK_ROOM_POINTS, tlo, thi, nt);
+                MinMax(d.room_h_hist, DESK_ROOM_POINTS, hlo, hhi, nh);
+                if (nt == 0) return "{\"success\":true,\"note\":\"history is still being collected, the chart fills up during the day\"}";
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"temp_min_24h\":%.1f,\"temp_max_24h\":%.1f,"
+                    "\"humidity_min_24h\":%.0f,\"humidity_max_24h\":%.0f,\"hours_of_data\":%d}",
+                    tlo, thi, nh ? hlo : 0.0f, nh ? hhi : 0.0f, nt / 6);
+                return buf;
+            }
+            case DESK_PAGE_BOTH: {
+                if (!d.room_ok || !d.weather.valid) {
+                    return "{\"success\":false,\"error\":\"need both room sensor and weather\"}";
+                }
+                bool cooler = d.weather.temperature < d.room_t;
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"home_c\":%.1f,\"outside_c\":%.1f,\"outside_is_cooler\":%s,"
+                    "\"note\":\"hatched areas on the chart show when it was cooler outside, a good time to open windows\"}",
+                    d.room_t, d.weather.temperature, cooler ? "true" : "false");
+                return buf;
+            }
+            case DESK_PAGE_SUN: {
+                if (!d.sun_ok) return "{\"success\":false,\"error\":\"no sun data yet\"}";
+                std::string rise = HourMin(d.sunrise), set = HourMin(d.sunset);
+                int len_min = (int)((d.sunset - d.sunrise) / 60);
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"sunrise\":\"%s\",\"sunset\":\"%s\",\"day_length\":\"%dh%02dm\",\"uv_index_max\":%.1f}",
+                    rise.c_str(), set.c_str(), len_min / 60, len_min % 60, d.uv_max < 0 ? 0.0f : d.uv_max);
+                return buf;
+            }
+            case DESK_PAGE_MOON: {
+                if (!time_ok) return "{\"success\":false,\"error\":\"time is not known yet\"}";
+                const double kSynodic = 29.530588853;
+                const double kNewMoonRef = 947182440.0;
+                double age = fmod(((double)d.now - kNewMoonRef) / 86400.0, kSynodic);
+                if (age < 0) age += kSynodic;
+                double phase = age / kSynodic;
+                int illum = (int)lround((1.0 - cos(2.0 * M_PI * phase)) / 2.0 * 100.0);
+                const char* name;
+                if (phase < 0.03 || phase > 0.97) name = "new moon";
+                else if (phase < 0.22) name = "waxing crescent";
+                else if (phase < 0.28) name = "first quarter";
+                else if (phase < 0.47) name = "waxing gibbous";
+                else if (phase < 0.53) name = "full moon";
+                else if (phase < 0.72) name = "waning gibbous";
+                else if (phase < 0.78) name = "last quarter";
+                else name = "waning crescent";
+                int to_full = (int)lround(fmod(0.5 - phase + 1.0, 1.0) * kSynodic);
+                int to_new = (int)lround(fmod(1.0 - phase, 1.0) * kSynodic);
+                snprintf(buf, sizeof(buf),
+                    "{\"success\":true,\"phase\":\"%s\",\"illumination_percent\":%d,"
+                    "\"days_to_full_moon\":%d,\"days_to_new_moon\":%d}",
+                    name, illum, to_full, to_new);
+                return buf;
+            }
+            case DESK_PAGE_BATTERY:
+                if (d.batt_days_left >= 0) {
+                    snprintf(buf, sizeof(buf), "{\"percent\":%d,\"days_left_estimate\":%d}",
+                             d.battery, d.batt_days_left);
+                } else {
+                    snprintf(buf, sizeof(buf), "{\"percent\":%d,\"days_left_estimate\":\"not enough history yet\"}",
+                             d.battery);
+                }
+                return buf;
+        }
+        return "{\"success\":false}";
     }
 
     // Подключение к Wi-Fi во сне, без запуска ассистента.

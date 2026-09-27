@@ -191,10 +191,17 @@ void CustomLcdDisplay::spi_port_init() {
     ESP_ERROR_CHECK(ret);
 }
 
+// Ждём, пока экран закончит обновляться (HIGH: занят, LOW: свободен).
+// Важно: pdMS_TO_TICKS(5) на этой плате даёт 0 (системный тик 10 мс),
+// а vTaskDelay(0) никому не уступает процессор. Раньше из-за этого каждая
+// смена лица на полсекунды занимала ядро целиком, и звук прерывался
+// ("квакал"). Теперь ждём минимум один тик, процессор свободен для звука.
 void CustomLcdDisplay::read_busy() {
     int busy = lcd_spi_data.busy;
+    TickType_t wait = pdMS_TO_TICKS(5);
+    if (wait == 0) wait = 1;
     while (gpio_get_level((gpio_num_t) busy) == 1) {
-        vTaskDelay(pdMS_TO_TICKS(5)); // LOW: idle, HIGH: busy
+        vTaskDelay(wait);
     }
 }
 
@@ -1397,6 +1404,16 @@ void CustomLcdDisplay::DrawPageBar(int page, int count) {
 void CustomLcdDisplay::RenderDeskPage(int page, const DeskScreenData& d, const uint8_t* old_frame,
                                       bool page_bar) {
     std::lock_guard<std::recursive_mutex> lock(draw_mutex_);
+    PaintDeskPage(page, d);
+    if (page_bar) {
+        DrawPageBar(page, DESK_PAGE_COUNT);
+    }
+    PresentAfterWake(old_frame);
+}
+
+// Рисует страницу режима часов в буфер. Используется и в режиме часов,
+// и для виджетов во время разговора.
+void CustomLcdDisplay::PaintDeskPage(int page, const DeskScreenData& d) {
     EPD_Clear();
     switch (page) {
         case DESK_PAGE_WEATHER:
@@ -1431,10 +1448,6 @@ void CustomLcdDisplay::RenderDeskPage(int page, const DeskScreenData& d, const u
             DrawClockScreen(d);
             break;
     }
-    if (page_bar) {
-        DrawPageBar(page, DESK_PAGE_COUNT);
-    }
-    PresentAfterWake(old_frame);
 }
 
 void CustomLcdDisplay::RenderFaceAfterWake(int face_type, const uint8_t* old_frame) {
@@ -1449,79 +1462,93 @@ void CustomLcdDisplay::EPD_Sleep() {
 }
 
 // ===== Виджеты по голосу =====
+// Голосовая команда только кладёт заявку и сразу возвращается.
+// Рисует задача лица: так экран никогда не тормозит разговор.
+
+bool CustomLcdDisplay::QueueWidget(int page, int seconds, const DeskScreenData* d,
+                                   const WeatherCache* w, bool room_ok, float t, float h) {
+    if (face_mode_ == FaceMode::kShuttingDown || booting_) return false;
+    if (req_data_ == nullptr) return false;   // аниматор ещё не запущен
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        if (d != nullptr) {
+            *req_data_ = *d;
+        } else {
+            *req_data_ = DeskScreenData();
+            req_data_->now = (int64_t)time(nullptr);
+        }
+        if (w != nullptr) req_data_->weather = *w;
+        if (page == DESK_PAGE_ROOM && d == nullptr) {
+            req_data_->room_ok = room_ok;
+            req_data_->room_t = t;
+            req_data_->room_h = h;
+        }
+        req_page_ = page;
+        req_seconds_ = seconds;
+        req_pending_ = true;
+    }
+    if (face_task_ != nullptr) xTaskNotifyGive(face_task_);   // разбудить, чтобы показал сразу
+    return true;
+}
 
 void CustomLcdDisplay::ShowWeatherWidget(const WeatherCache& w, int seconds) {
-    if (face_mode_ == FaceMode::kShuttingDown) return;
-    if (booting_) return;
-
-    // Если предыдущий виджет висит совсем недолго, встаём в очередь.
-    int64_t started_check = esp_timer_get_time() / 1000;
-    if (face_mode_ == FaceMode::kWidget && widget_timer_ != nullptr) {
-        int64_t shown = started_check - widget_started_ms_;
-        if (shown < kMinWidgetMs) {
-            pending_widget_ = true;
-            pending_kind_ = 1;
-            pending_weather_ = w;
-            pending_seconds_ = seconds;
-            esp_timer_stop(widget_timer_);
-            esp_timer_start_once(widget_timer_, (int64_t)(kMinWidgetMs - shown) * 1000);
-            return;
-        }
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(draw_mutex_);
-    face_mode_ = FaceMode::kWidget;
-    current_face_ = -1;
-    EPD_Clear();
-    DrawWeatherScreen(w);
-    EPD_DisplayPart();
-    StartWidgetTimer(seconds);
+    QueueWidget(DESK_PAGE_WEATHER, seconds, nullptr, &w, false, 0, 0);
 }
 
 void CustomLcdDisplay::ShowRoomWidget(float temperature, float humidity, int seconds) {
-    if (face_mode_ == FaceMode::kShuttingDown) return;
-    if (booting_) return;
-
-    // Если предыдущий виджет висит совсем недолго, встаём в очередь.
-    int64_t started_check = esp_timer_get_time() / 1000;
-    if (face_mode_ == FaceMode::kWidget && widget_timer_ != nullptr) {
-        int64_t shown = started_check - widget_started_ms_;
-        if (shown < kMinWidgetMs) {
-            pending_widget_ = true;
-            pending_kind_ = 2;
-            pending_temp_ = temperature;
-            pending_hum_ = humidity;
-            pending_seconds_ = seconds;
-            esp_timer_stop(widget_timer_);
-            esp_timer_start_once(widget_timer_, (int64_t)(kMinWidgetMs - shown) * 1000);
-            return;
-        }
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(draw_mutex_);
-    face_mode_ = FaceMode::kWidget;
-    current_face_ = -1;
-    EPD_Clear();
-    DrawRoomScreen(temperature, humidity);
-    EPD_DisplayPart();
-    StartWidgetTimer(seconds);
+    QueueWidget(DESK_PAGE_ROOM, seconds, nullptr, nullptr, true, temperature, humidity);
 }
 
-// Таймер, по которому виджет уходит (или показывается следующий из очереди).
-void CustomLcdDisplay::StartWidgetTimer(int seconds) {
-    if (widget_timer_ == nullptr) {
-        esp_timer_create_args_t args = {};
-        args.callback = [](void* arg) {
-            static_cast<CustomLcdDisplay*>(arg)->OnWidgetTimer();
-        };
-        args.arg = this;
-        args.dispatch_method = ESP_TIMER_TASK;
-        args.name = "widget_hide";
-        esp_timer_create(&args, &widget_timer_);
+void CustomLcdDisplay::ShowDeskWidget(int page, const DeskScreenData& d, int seconds) {
+    if (page < 0 || page >= DESK_PAGE_COUNT) return;
+    QueueWidget(page, seconds, &d, nullptr, false, 0, 0);
+}
+
+// Вызывается задачей лица перед каждым шагом аниматора.
+void CustomLcdDisplay::ServeWidget(int64_t now_ms) {
+    FaceMode mode = face_mode_;
+    if (mode == FaceMode::kShuttingDown || mode == FaceMode::kBooting || booting_) {
+        return;
     }
-    esp_timer_stop(widget_timer_);
-    widget_started_ms_ = esp_timer_get_time() / 1000;
-    esp_timer_start_once(widget_timer_, (int64_t)seconds * 1000000);
+
+    bool have_req;
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        have_req = req_pending_;
+    }
+
+    if (have_req) {
+        // Предыдущий виджет покажем хотя бы kMinWidgetMs, потом сменим.
+        bool can_show = (mode != FaceMode::kWidget) || (now_ms - widget_started_ms_ >= kMinWidgetMs);
+        if (!can_show) return;
+
+        int page, seconds;
+        {
+            std::lock_guard<std::mutex> lock(req_mutex_);
+            DeskScreenData* tmp = shown_data_;
+            shown_data_ = req_data_;
+            req_data_ = tmp;
+            page = req_page_;
+            seconds = req_seconds_;
+            req_pending_ = false;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(draw_mutex_);
+        mode = face_mode_;
+        if (mode == FaceMode::kShuttingDown || mode == FaceMode::kBooting || booting_) return;
+        face_mode_ = FaceMode::kWidget;
+        current_face_ = -1;
+        PaintDeskPage(page, *shown_data_);
+        EPD_DisplayPart();
+        last_draw_ms_ = now_ms;
+        widget_started_ms_ = now_ms;
+        widget_until_ms_ = now_ms + (int64_t)seconds * 1000;
+        return;
+    }
+
+    if (mode == FaceMode::kWidget && now_ms >= widget_until_ms_) {
+        HideWidget();
+    }
 }
 
 void CustomLcdDisplay::HideWidget() {
@@ -1535,28 +1562,6 @@ void CustomLcdDisplay::HideWidget() {
         SetStatus(Lang::Strings::LISTENING);
     }
     force_redraw_ = true;
-}
-
-void CustomLcdDisplay::OnWidgetTimer() {
-    // Если за это время устройство начало выключаться, очередь выбрасываем,
-    // чтобы виджет не нарисовался поверх грустного лица.
-    if (face_mode_ != FaceMode::kWidget) {
-        pending_widget_ = false;
-        return;
-    }
-    if (pending_widget_) {
-        pending_widget_ = false;
-        int kind = pending_kind_;
-        int secs = pending_seconds_;
-        face_mode_ = FaceMode::kIdle;   // чтобы показ не отложился снова
-        if (kind == 1) {
-            ShowWeatherWidget(pending_weather_, secs);
-        } else {
-            ShowRoomWidget(pending_temp_, pending_hum_, secs);
-        }
-        return;
-    }
-    HideWidget();
 }
 
 // =====================================================================
@@ -1605,26 +1610,44 @@ static constexpr int kSleepAnimMs = 20 * 60 * 1000;  // сколько Zzz ан�
 static constexpr int kThinkAfterSilenceMs = 800;     // тишина после твоей фразы, и он "задумался"
 static constexpr int kThinkMaxMs = 12000;            // дольше не думает, возвращается к слушанию
 
+// Спокойный темп в разговоре. Каждое обновление e-paper это ~0.3 с работы
+// экрана, поэтому во время разговора лицо меняется редко.
+static constexpr bool kSpeakMouthMoves = true;       // false: рот открыт всю фразу, без смены кадров
+static constexpr int kSpeakMouthMinMs = 2000;        // рот держит форму минимум столько
+static constexpr int kSpeakMouthMaxMs = 3000;        // и максимум столько
+static constexpr int kSpeakPauseMs = 1200;           // тишина дольше этого = пауза, рот закрывается
+static constexpr int kThinkSwapMs = 3000;            // "думает": как часто переводит взгляд
+static constexpr int kTalkMinRedrawMs = 1500;        // в разговоре не чаще одного кадра за столько
+static constexpr UBaseType_t kFaceTaskPriority = 1;  // ниже звука (2 и выше), экран подождёт
+
 static int RandRange(int lo, int hi) {
     return lo + (int)(esp_random() % (uint32_t)(hi - lo + 1));
 }
 
+// Аниматор живёт в своей задаче с самым низким приоритетом. Раньше он
+// работал в системном таймере с очень высоким приоритетом, и пока экран
+// обновлялся, звук не успевал декодироваться.
 void CustomLcdDisplay::StartAnimator() {
-    if (anim_timer_ != nullptr) return;
-    esp_timer_create_args_t args = {};
-    args.callback = [](void* arg) {
-        static_cast<CustomLcdDisplay*>(arg)->AnimTick();
-    };
-    args.arg = this;
-    args.dispatch_method = ESP_TIMER_TASK;
-    args.name = "face_anim";
-    args.skip_unhandled_events = true;
-    if (esp_timer_create(&args, &anim_timer_) != ESP_OK) {
-        ESP_LOGE(TAG, "Face animator: failed to create timer");
-        return;
-    }
+    if (face_task_ != nullptr) return;
+    if (req_data_ == nullptr) req_data_ = new DeskScreenData();
+    if (shown_data_ == nullptr) shown_data_ = new DeskScreenData();
     last_tick_ms_ = esp_timer_get_time() / 1000;
-    esp_timer_start_periodic(anim_timer_, (int64_t)kAnimTickMs * 1000);
+    BaseType_t ok = xTaskCreate([](void* arg) {
+        static_cast<CustomLcdDisplay*>(arg)->FaceTask();
+    }, "face_anim", 8192, this, kFaceTaskPriority, &face_task_);
+    if (ok != pdPASS) {
+        face_task_ = nullptr;
+        ESP_LOGE(TAG, "Face animator: failed to create task");
+    }
+}
+
+void CustomLcdDisplay::FaceTask() {
+    while (true) {
+        // Спим до следующего шага, или просыпаемся раньше, если пришёл виджет.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kAnimTickMs));
+        ServeWidget(esp_timer_get_time() / 1000);
+        AnimTick();
+    }
 }
 
 void CustomLcdDisplay::StartSequence(const AnimFrame* frames, int count) {
@@ -1716,17 +1739,12 @@ void CustomLcdDisplay::PickIdleEvent() {
     next_event_ms_ = RandRange(3000, 9000);
 }
 
-// Пока слушает: моргает и иногда косится в сторону.
+// Пока слушает: изредка косится в сторону. Без морганий: в разговоре
+// каждый кадр на счету, а короткое моргание на e-paper всё равно смазано.
 void CustomLcdDisplay::PickListenEvent() {
-    int r = RandRange(0, 99);
-    if (r < 75) {
-        AnimFrame f[] = { MakeFrame(EYES_CLOSED, MOUTH_DOT, 300) };
-        StartSequence(f, 1);
-    } else {
-        AnimFrame f[] = { MakeFrame(RandRange(0, 1) ? EYES_LOOK_L : EYES_LOOK_R, MOUTH_DOT, 1000) };
-        StartSequence(f, 1);
-    }
-    next_event_ms_ = RandRange(3000, 6000);
+    AnimFrame f[] = { MakeFrame(RandRange(0, 1) ? EYES_LOOK_L : EYES_LOOK_R, MOUTH_DOT, 2500) };
+    StartSequence(f, 1);
+    next_event_ms_ = RandRange(10000, 18000);
 }
 
 // Главное решение: какое лицо сейчас показать. dt - сколько прошло мс.
@@ -1743,6 +1761,7 @@ CustomLcdDisplay::AnimFrame CustomLcdDisplay::DecideFrame(int dt) {
         silence_ms_ = 0;
         think_ms_ = 0;
         play_ms_ = 0;
+        quiet_ms_ = 0;
         speak_mouth_ = MOUTH_FLAT;
         speak_mouth_left_ms_ = 0;
         next_event_ms_ = (mode == FaceMode::kIdle) ? RandRange(2500, 5000) : RandRange(2500, 4500);
@@ -1772,36 +1791,38 @@ CustomLcdDisplay::AnimFrame CustomLcdDisplay::DecideFrame(int dt) {
 
     switch (mode) {
         case FaceMode::kSpeaking: {
-            // Рот двигается, только когда звук реально играет, и каждый
-            // раз немного по-разному. Глаза от эмоции, иногда моргает.
+            // Рот открыт, пока звук реально играет, и меняет форму раз в
+            // 2-3 секунды. Короткие паузы между словами рот не закрывают,
+            // иначе экран дёргался бы на каждой запятой. Глаза от эмоции.
             bool playing = !Application::GetInstance().GetAudioService().IsPlaybackIdle();
-            play_ms_ = playing ? play_ms_ + dt : 0;
+            if (playing) {
+                quiet_ms_ = 0;
+                play_ms_ += dt;
+            } else {
+                quiet_ms_ += dt;
+                if (quiet_ms_ >= kSpeakPauseMs) play_ms_ = 0;
+            }
             int mouth = (style.mouth == MOUTH_IDLE) ? (int)MOUTH_FLAT : (int)style.mouth;
-            if (play_ms_ >= kAnimTickMs) {
+            if (play_ms_ > 0) {
                 speak_mouth_left_ms_ -= dt;
-                if (speak_mouth_left_ms_ <= 0) {
-                    static const int8_t kOpen[] = { MOUTH_OPEN, MOUTH_OPEN_S, MOUTH_OPEN_W, MOUTH_OPEN,
-                                                    MOUTH_FLAT };
-                    int next = speak_mouth_;
-                    for (int tries = 0; tries < 4 && next == speak_mouth_; tries++) {
-                        next = kOpen[RandRange(0, sizeof(kOpen) - 1)];
+                if (speak_mouth_ == mouth || speak_mouth_left_ms_ <= 0) {
+                    if (!kSpeakMouthMoves) {
+                        speak_mouth_ = MOUTH_OPEN;
+                    } else {
+                        static const int8_t kOpen[] = { MOUTH_OPEN, MOUTH_OPEN_S, MOUTH_OPEN_W };
+                        int next = speak_mouth_;
+                        for (int tries = 0; tries < 4 && next == speak_mouth_; tries++) {
+                            next = kOpen[RandRange(0, sizeof(kOpen) - 1)];
+                        }
+                        speak_mouth_ = next;
                     }
-                    speak_mouth_ = next;
-                    speak_mouth_left_ms_ = RandRange(400, 700);
+                    speak_mouth_left_ms_ = RandRange(kSpeakMouthMinMs, kSpeakMouthMaxMs);
                 }
                 mouth = speak_mouth_;
             } else {
                 speak_mouth_ = mouth;
             }
-            int eyes = style.eyes;
-            speak_blink_ms_ -= dt;
-            if (speak_blink_ms_ <= 0) {
-                speak_blink_ms_ = RandRange(3500, 7000);
-                if (eyes == EYES_OPEN || eyes == EYES_HAPPY || eyes == EYES_SAD) {
-                    return MakeFrame(EYES_CLOSED, mouth, 300);
-                }
-            }
-            return MakeFrame(eyes, mouth, 0);
+            return MakeFrame(style.eyes, mouth, 0);
         }
 
         case FaceMode::kEmotion: {
@@ -1833,7 +1854,7 @@ CustomLcdDisplay::AnimFrame CustomLcdDisplay::DecideFrame(int dt) {
                         heard_voice_ = false;
                         think_ms_ = 0;
                     } else {
-                        bool left = ((think_ms_ / 900) % 2) == 0;
+                        bool left = ((think_ms_ / kThinkSwapMs) % 2) == 0;
                         return MakeFrame(left ? EYES_UP_L : EYES_UP_R, MOUTH_THINK, 0);
                     }
                 } else {
@@ -1948,8 +1969,16 @@ void CustomLcdDisplay::AnimTick() {
 
     bool same = (f.full == drawn_full_) && (f.eyes == drawn_eyes_) && (f.mouth == drawn_mouth_);
     if (same && !force_redraw_) return;
+
+    // В разговоре экран обновляем не чаще раза в kTalkMinRedrawMs.
+    // Смена режима (слушает -> говорит) рисуется сразу.
+    bool talking = (mode == FaceMode::kSpeaking || mode == FaceMode::kListening ||
+                    mode == FaceMode::kEmotion);
+    if (talking && !force_redraw_ && (now - last_draw_ms_) < kTalkMinRedrawMs) return;
+
     force_redraw_ = false;
     DrawAnimFrame(f);
+    last_draw_ms_ = esp_timer_get_time() / 1000;
 }
 
 void CustomLcdDisplay::SetStatus(const char* status) {
@@ -1981,8 +2010,9 @@ void CustomLcdDisplay::SetEmotion(const char* emotion) {
     if (booting_) return;
     for (int i = 0; i < kEmotionCount; i++) {
         if (strcmp(emotion, kEmotionStyles[i].name) == 0) {
+            // Та же эмоция приходит повторно на каждой фразе: экран не трогаем.
+            // Новая нарисуется на ближайшем разрешённом кадре.
             emotion_ = i;
-            force_redraw_ = true;
             return;
         }
     }
@@ -2002,4 +2032,4 @@ void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
 void CustomLcdDisplay::SetTheme(Theme* theme) {
     ESP_LOGI(TAG, "SetTheme: skipped (custom face UI)");
     // не применяем тему, виджетов нет
-}
+}

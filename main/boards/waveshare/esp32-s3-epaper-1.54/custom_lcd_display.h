@@ -7,6 +7,8 @@
 #include "widget_art.h"
 #include <mutex>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 /* Display color */
 typedef enum {
     DRIVER_COLOR_WHITE  = 0xff,
@@ -100,8 +102,11 @@ public:
     void EPD_Init();    /* e-paper init */
     void EPD_Clear();   /* clear screen */
     void EPD_Display(); /* flush buffer to e-paper */
+    // Виджеты по голосу. Только передают заявку, рисует сам аниматор
+    // в своей тихой задаче, поэтому вызов возвращается сразу.
     void ShowWeatherWidget(const WeatherCache& w, int seconds);
     void ShowRoomWidget(float temperature, float humidity, int seconds);
+    void ShowDeskWidget(int page, const DeskScreenData& d, int seconds);   // любая страница часов
 
     /* режим часов (deep sleep) */
     // Рисует страницу и выводит её на экран. old_frame: что было на экране
@@ -132,8 +137,8 @@ public:
     void SetShuttingDown(bool value) {
         face_mode_ = value ? FaceMode::kShuttingDown : FaceMode::kIdle;
         if (value) {
-            if (widget_timer_) esp_timer_stop(widget_timer_);
-            pending_widget_ = false;
+            std::lock_guard<std::mutex> lock(req_mutex_);
+            req_pending_ = false;   // виджет из очереди уже не нужен
         }
     }
 
@@ -172,7 +177,6 @@ private:
     void read_busy();
     volatile FaceMode face_mode_ = FaceMode::kIdle;
     volatile bool booting_ = false;
-    esp_timer_handle_t widget_timer_ = nullptr;
     void HideWidget();
     void set_cs_1(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,1);}
     void set_cs_0(){gpio_set_level((gpio_num_t)lcd_spi_data.cs,0);}
@@ -193,11 +197,12 @@ private:
     void EPD_TurnOnDisplayPart();
 
     // ===== Живое лицо: аниматор =====
-    // Всё лицо рисует только аниматор, 4 раза в секунду он решает, что
-    // показать. Экран защищён общей блокировкой, чтобы два рисования
-    // никогда не шли одновременно.
+    // Всё лицо и виджеты рисует только аниматор, в своей задаче с самым
+    // низким приоритетом: звук и сеть всегда важнее экрана. Экран защищён
+    // общей блокировкой, чтобы два рисования никогда не шли одновременно.
     std::recursive_mutex draw_mutex_;
-    esp_timer_handle_t anim_timer_ = nullptr;
+    TaskHandle_t face_task_ = nullptr;
+    int64_t last_draw_ms_ = 0;            // когда последний раз обновляли экран
     volatile bool force_redraw_ = true;
     volatile bool wifi_weak_request_ = false;
     volatile int emotion_ = 0;            // индекс в таблице эмоций, 0 = обычное
@@ -216,7 +221,7 @@ private:
     int speak_mouth_ = 0;
     int speak_mouth_left_ms_ = 0;
     int play_ms_ = 0;
-    int speak_blink_ms_ = 4000;
+    int quiet_ms_ = 0;                    // сколько мс звук молчит (паузы между фразами)
     // слушает
     bool heard_voice_ = false;
     int silence_ms_ = 0;
@@ -225,6 +230,7 @@ private:
     int emotion_hold_ms_ = 0;
 
     void StartAnimator();
+    void FaceTask();
     void AnimTick();
     void StartSequence(const AnimFrame* frames, int count);
     void PickIdleEvent();
@@ -269,17 +275,20 @@ private:
     void PaintFace(int face_type);
     void PresentAfterWake(const uint8_t* old_frame);
     void DrawPageBar(int page, int count);
+    void PaintDeskPage(int page, const DeskScreenData& d);   // страница в буфер, без вывода
 
-    // виджеты по голосу
-    void StartWidgetTimer(int seconds);
+    // виджеты по голосу: одна заявка в очереди, рисует задача лица
+    std::mutex req_mutex_;
+    bool req_pending_ = false;
+    int req_page_ = 0;
+    int req_seconds_ = 0;
+    DeskScreenData* req_data_ = nullptr;     // заявка (заполняет тот, кто попросил)
+    DeskScreenData* shown_data_ = nullptr;   // то, что сейчас на экране
     int64_t widget_started_ms_ = 0;
-    bool pending_widget_ = false;
-    int pending_kind_ = 0;            // 1 погода, 2 комната
-    WeatherCache pending_weather_;
-    float pending_temp_ = 0.0f;
-    float pending_hum_ = 0.0f;
-    int pending_seconds_ = 0;
-    void OnWidgetTimer();
+    int64_t widget_until_ms_ = 0;
+    bool QueueWidget(int page, int seconds, const DeskScreenData* d,
+                     const WeatherCache* w, bool room_ok, float t, float h);
+    void ServeWidget(int64_t now_ms);
 };
 
-#endif // __CUSTOM_LCD_DISPLAY_H__
+#endif // __CUSTOM_LCD_DISPLAY_H__
